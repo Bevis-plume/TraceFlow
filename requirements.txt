@@ -1,0 +1,33 @@
+# =============================================================================
+# Trackable Latent Diffusion — Python Dependencies
+# =============================================================================
+# Install with:  pip install -r requirements.txt
+# Tested on Python 3.10 / 3.11, CUDA 11.8 / 12.1
+
+# --- Core deep learning ---
+torch>=2.2.0
+torchvision>=0.17.0
+
+# --- Configuration ---
+pyyaml>=6.0.1
+
+# --- Progress bars ---
+tqdm>=4.66.0
+
+# --- Numerical computing ---
+numpy>=1.26.0
+
+# --- Image quality metrics (optional but recommended) ---
+scikit-image>=0.22.0
+
+# --- Visualisation ---
+matplotlib>=3.8.0
+Pillow>=10.2.0
+
+# --- Experiment tracking (optional) ---
+# Uncomment if using Weights & Biases:
+# wandb>=0.16.0
+
+# --- Type checking / linting (dev only) ---
+# mypy>=1.8.0
+# ruff>=0.3.0
