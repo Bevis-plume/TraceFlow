@@ -1,39 +1,16 @@
 """
 src/models/watermarker.py
 =========================
-Lightweight MLP watermark detector that operates in the *permuted*
-latent space z' ∈ ℝ^{C_z × H_z × W_z} = ℝ^{4 × 8 × 8}.
+Block-coded watermark detector for mixed latent representations.
 
-Mathematical role
------------------
-Given the permuted (and cryptographically scrambled) latent z', the
-Watermarker W_φ predicts a copyright bit-stream w ∈ {0,1}^M:
+The latent is flattened and split into equal-sized blocks.  A shared MLP
+maps each block to a small bit-group, and the concatenation of all groups
+forms the full watermark vector:
 
-    ŵ = σ( W_φ( flatten(z') ) )   ∈ (0,1)^M                        (1)
+    z' -> block_1, ..., block_N -> bits_1, ..., bits_N -> w_hat
 
-where σ(·) is the element-wise sigmoid.  During training, ŵ is pushed
-towards a *fixed* target bit-string w* via Binary Cross-Entropy loss:
-
-    L_wm = BCE( ŵ, w* )                                              (2)
-
-This loss term is combined with the diffusion denoising loss:
-
-    L_total = L_diffusion + λ · L_wm                                 (3)
-
-Traceability argument
----------------------
-An attacker who inverts gradients recovers ẑ_dummy ≈ z' (a corrupted
-permuted latent).  Because the permutation π_K is unknown to the attacker,
-ẑ_dummy decoded through the VAE produces visual noise.  However, running
-ẑ_dummy (or its re-encoded latent) through W_φ still produces ŵ ≈ w*,
-because the Watermarker was trained on z' which has the same
-spatial-channel statistics as ẑ_dummy — enabling forensic attribution.
-
-Dimension contract (matches configs/default.yml)
--------------------------------------------------
-    input_dim  = C_z × H_z × W_z = 4 × 8 × 8 = 256
-    hidden_dims = [512, 256]
-    output_dim = 64           (64-bit copyright message)
+This makes the watermark more structured than a single global classifier and
+aligns better with the block-wise invertible mixing used by the permuter.
 """
 
 from __future__ import annotations
@@ -44,20 +21,14 @@ import torch.nn.functional as F
 
 
 class Watermarker(nn.Module):
-    """Multi-layer perceptron that extracts a watermark from a permuted latent.
-
-    Architecture:
-        flatten(z')  →  [Linear(D, h_0) → BN → SiLU → Dropout]
-                     →  [Linear(h_{i-1}, h_i) → BN → SiLU → Dropout] × n
-                     →  Linear(h_n, M) → Sigmoid
-                     →  ŵ ∈ (0,1)^M
+    """Shared block-wise MLP watermark detector.
 
     Args:
-        input_dim:   Flat dimension D of z' (default 256 = 4×8×8).
-        hidden_dims: Sequence of hidden layer widths (default [512, 256]).
-        output_dim:  Watermark bit-length M (default 64).
-        dropout:     Dropout probability applied after each hidden layer
-                     (default 0.1).
+        input_dim: Flat latent dimension D.
+        hidden_dims: Hidden widths for the per-block MLP.
+        output_dim: Total watermark length M.
+        block_size: Size of each latent block.
+        dropout: Dropout after hidden layers.
     """
 
     def __init__(
@@ -65,113 +36,64 @@ class Watermarker(nn.Module):
         input_dim: int = 256,
         hidden_dims: list[int] | None = None,
         output_dim: int = 64,
+        block_size: int = 16,
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
         if hidden_dims is None:
-            hidden_dims = [512, 256]
+            hidden_dims = [128, 64]
+        if input_dim % block_size != 0:
+            raise ValueError("input_dim must be divisible by block_size")
+        if output_dim % (input_dim // block_size) != 0:
+            raise ValueError("output_dim must be divisible by num_blocks")
+
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.block_size = block_size
+        self.num_blocks = input_dim // block_size
+        self.bits_per_block = output_dim // self.num_blocks
 
         layers: list[nn.Module] = []
-        in_dim = input_dim
+        in_dim = block_size
         for h_dim in hidden_dims:
             layers += [
                 nn.Linear(in_dim, h_dim),
-                nn.BatchNorm1d(h_dim),
+                nn.LayerNorm(h_dim),
                 nn.SiLU(),
                 nn.Dropout(dropout),
             ]
             in_dim = h_dim
-
-        layers += [
-            nn.Linear(in_dim, output_dim),
-            nn.Sigmoid(),    # ŵ ∈ (0,1)^M, interpreted as bit probabilities
-        ]
-
-        self.net = nn.Sequential(*layers)
-
-        # Store dimension for shape-checks
-        self.input_dim = input_dim
-        self.output_dim = output_dim
+        layers.append(nn.Linear(in_dim, self.bits_per_block))
+        self.block_net = nn.Sequential(*layers)
 
     def forward(self, z_prime: torch.Tensor) -> torch.Tensor:
-        """Predict the copyright bit-stream from a permuted latent.
-
-        Args:
-            z_prime: Permuted latent z' of shape (B, C_z, H_z, W_z)
-                     **or** already-flattened shape (B, D).
-                     This must be the *permuted* representation (after
-                     LatentPermuter.forward) — passing the original z
-                     will only degrade watermark accuracy.
-
-        Returns:
-            w_hat: Predicted bit probabilities of shape (B, M),
-                   where M = output_dim.  Values ∈ (0,1).
-                   Threshold at 0.5 to recover binary bits.
-        """
+        """Predict the watermark bits from a mixed latent."""
         if z_prime.dim() > 2:
-            # Flatten spatial-channel dims while preserving batch axis
-            z_flat = z_prime.view(z_prime.size(0), -1)           # (B, D)
+            z_flat = z_prime.view(z_prime.size(0), -1)
         else:
-            z_flat = z_prime                                      # (B, D)
+            z_flat = z_prime
 
         assert z_flat.size(1) == self.input_dim, (
-            f"Watermarker expects input_dim={self.input_dim}, "
-            f"got {z_flat.size(1)}.  Check latent shape."
+            f"Watermarker expects input_dim={self.input_dim}, got {z_flat.size(1)}"
         )
 
-        return self.net(z_flat)                                   # (B, M)
-
-    # ------------------------------------------------------------------
-    # Loss helpers
-    # ------------------------------------------------------------------
+        blocks = z_flat.view(z_flat.size(0) * self.num_blocks, self.block_size)
+        bits = self.block_net(blocks)
+        bits = torch.sigmoid(bits)
+        return bits.view(z_flat.size(0), self.output_dim)
 
     @staticmethod
     def loss(w_hat: torch.Tensor, w_target: torch.Tensor) -> torch.Tensor:
-        """Binary Cross-Entropy watermark loss  L_wm = BCE(ŵ, w*).
-
-        Args:
-            w_hat:    Predicted bit probabilities (B, M), from forward().
-            w_target: Target bit-string (M,) or (B, M), dtype float, values
-                      in {0.0, 1.0}.  Broadcast across batch if 1-D.
-
-        Returns:
-            Scalar BCE loss.
-        """
         return F.binary_cross_entropy(w_hat, w_target.expand_as(w_hat))
 
     @staticmethod
     def bit_accuracy(w_hat: torch.Tensor, w_target: torch.Tensor) -> torch.Tensor:
-        """Fraction of correctly decoded bits (threshold at 0.5).
-
-        Args:
-            w_hat:    Predicted bit probabilities (B, M).
-            w_target: Ground-truth bits (M,) or (B, M), float {0., 1.}.
-
-        Returns:
-            Scalar accuracy in [0, 1].
-        """
         predicted_bits = (w_hat >= 0.5).float()
         target_bits = w_target.expand_as(predicted_bits)
         return (predicted_bits == target_bits).float().mean()
 
 
-# ---------------------------------------------------------------------------
-# Target watermark utilities
-# ---------------------------------------------------------------------------
-
 def generate_random_watermark(bit_length: int, seed: int | None = None) -> torch.Tensor:
-    """Generate a fixed random binary target watermark w* ∈ {0,1}^M.
-
-    The watermark is deterministic given `seed` so that the same target is
-    used both during training and during forensic evaluation.
-
-    Args:
-        bit_length: Watermark bit-length M (e.g. 64).
-        seed:       Optional integer seed for reproducibility.
-
-    Returns:
-        w_star: Float tensor of shape (M,) with values in {0., 1.}.
-    """
     rng = torch.Generator()
     if seed is not None:
         rng.manual_seed(seed)

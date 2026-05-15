@@ -32,7 +32,6 @@ import sys
 import numpy as np
 import torch
 import torchvision
-import torchvision.transforms as T
 import torchvision.utils as vutils
 import yaml
 
@@ -44,6 +43,7 @@ from src.models.unet import UNet
 from src.models.vae import VAE
 from src.models.watermarker import Watermarker
 from src.pipeline.trainer import Trainer, TrainerConfig
+from src.utils.image import cifar10_transform, from_vae_output
 
 logging.basicConfig(
     level=logging.INFO,
@@ -103,18 +103,29 @@ def restore_from_checkpoint(
     latent_dim = vc["latent_channels"] * vc["latent_spatial"] ** 2
 
     vae = VAE(vc["in_channels"], vc["latent_channels"], vc["base_channels"], vc["kl_weight"])
-    permuter = LatentPermuter(pc["secret_key"], latent_dim, pc["bias_scale"])
+    permuter = LatentPermuter(
+        secret_key=pc["secret_key"],
+        latent_dim=latent_dim,
+        block_size=pc.get("block_size", 16),
+        bias_scale=pc["bias_scale"],
+    )
     unet = UNet(
         vc["latent_channels"], uc["model_channels"], uc["channel_mult"],
         uc["num_res_blocks"], uc["time_embed_dim"], uc["dropout"],
     )
-    watermarker = Watermarker(wc["input_dim"], wc["hidden_dims"], wc["output_dim"], wc["dropout"])
+    watermarker = Watermarker(
+        input_dim=wc["input_dim"],
+        hidden_dims=wc["hidden_dims"],
+        output_dim=wc["output_dim"],
+        block_size=wc.get("block_size", pc.get("block_size", 16)),
+        dropout=wc["dropout"],
+    )
 
     ckpt = torch.load(checkpoint_path, map_location=device)
     vae.load_state_dict(ckpt["vae_state"])
     unet.load_state_dict(ckpt["unet_state"])
     watermarker.load_state_dict(ckpt["watermarker_state"])
-    permuter.load_state_dict(ckpt["permuter_state"])
+    permuter.load_state_dict(ckpt.get("permuter_state", {}), strict=False)
 
     for m in [vae, permuter, unet, watermarker]:
         m.to(device).eval()
@@ -149,10 +160,7 @@ def main() -> None:
     )
 
     # ── Get one test sample ────────────────────────────────────────────
-    transform = T.Compose([
-        T.ToTensor(),
-        T.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-    ])
+    transform = cifar10_transform()
     test_set = torchvision.datasets.CIFAR10(
         root=cfg["data"]["root"], train=False, download=True, transform=transform
     )
@@ -174,9 +182,6 @@ def main() -> None:
     )
     trainer = Trainer(vae, permuter, unet, watermarker, trainer_config)
 
-    logger.info("Computing target gradients (simulating gradient leakage)…")
-    target_grads = trainer.get_target_gradients(x)   # list of CPU tensors
-
     # ── Run attack ─────────────────────────────────────────────────────
     a_cfg = cfg["attack"]
     attack_config = AttackConfig(
@@ -188,9 +193,26 @@ def main() -> None:
         beta_start=d_cfg["beta_start"],
         beta_end=d_cfg["beta_end"],
         lambda_wm=t_cfg["lambda_wm"],
+        latent_spatial=cfg["vae"]["latent_spatial"],
         wm_bits=cfg["watermarker"]["output_dim"],
         verbose=50,
     )
+
+    attack_t = torch.full((x.size(0),), attack_config.attack_t, device=device, dtype=torch.long)
+    fixed_noise = torch.randn(
+        x.size(0),
+        cfg["vae"]["latent_channels"],
+        cfg["vae"]["latent_spatial"],
+        cfg["vae"]["latent_spatial"],
+        device=device,
+    )
+
+    logger.info("Computing target gradients (simulating gradient leakage)…")
+    target_grads = trainer.get_target_gradients(
+        x,
+        t=attack_t,
+        noise=fixed_noise,
+    )   # list of CPU tensors
 
     attacker = GradientInversionAttack(
         vae, permuter, unet, watermarker, attack_config, device=str(device)
@@ -198,7 +220,7 @@ def main() -> None:
 
     logger.info("Starting gradient inversion (optimizer=%s, max_iter=%d)…",
                 a_cfg["optimizer"], a_cfg["max_iter"])
-    results = attacker.run(target_grads, image_shape=x.shape)
+    results = attacker.run(target_grads, image_shape=x.shape, fixed_noise=fixed_noise)
 
     # ── Save outputs ───────────────────────────────────────────────────
     # Attacker's reconstructed image (expected: semantically incoherent)
@@ -208,7 +230,7 @@ def main() -> None:
 
     # Original target image (for reference / SSIM comparison)
     # Denormalise from [−1,1] → [0,1]
-    x_display = (x.cpu() * 0.5 + 0.5).clamp(0, 1)
+    x_display = from_vae_output(x.cpu())
     target_img_path = os.path.join(args.output_dir, "target_image.png")
     vutils.save_image(x_display, target_img_path)
     logger.info("Target image saved  → %s", target_img_path)

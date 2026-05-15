@@ -53,16 +53,18 @@ diffusion:
 # -----------------------------------------------------------------------------
 watermarker:
   input_dim: 256           # = latent_channels * latent_spatial^2
-  hidden_dims: [512, 256]
+  hidden_dims: [128, 64]
   output_dim: 64           # target watermark bit-length |w|
+  block_size: 16           # block-coded watermark: 16 blocks × 4 bits/block
   dropout: 0.1
 
 # -----------------------------------------------------------------------------
-# LatentPermuter  (crypto module, key K controls π_K and β_K)
-# z' = π_K(z) + β_K
+# LatentPermuter  (crypto module, key K controls block-wise M_K and β_K)
+# z' = M_K(z) + β_K
 # -----------------------------------------------------------------------------
 permuter:
   secret_key: "CHANGE_ME_BEFORE_EXPERIMENT"  # NEVER commit real key to VCS
+  block_size: 16          # keyed orthogonal mixing block size
   bias_scale: 0.1          # scale of the additive bias β_K ~ U(-scale, scale)
 
 # -----------------------------------------------------------------------------

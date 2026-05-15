@@ -17,11 +17,12 @@ The attacker:
 
 Attack algorithm
 ----------------
-Initialise  ẑ_dummy ~ N(0, I)  (in the *pixel* domain, then encode)
+Initialise  ẑ_dummy in the pixel domain and optimise it directly in
+[0, 1] with a sigmoid parameterisation.
 Repeat for max_iter steps:
-    1. z_dummy = VAE.encode(x_dummy).sample               (or init in latent space)
+    1. z_dummy = VAE.encode(x_dummy).sample
     2. z'_dummy = LatentPermuter.forward(z_dummy)
-    3. z'_dummy_t = q_sample(z'_dummy, t_fixed)
+    3. z'_dummy_t = q_sample(z'_dummy, t_fixed, fixed_noise)
     4. ε_pred = UNet(z'_dummy_t, t_fixed)
     5. ŵ_dummy = Watermarker(z'_dummy)
     6. L_match = MSE(∇_θ(L_dummy), target_grads)          (gradient-matching loss)
@@ -78,6 +79,7 @@ class AttackConfig:
         beta_start:   β_1.
         beta_end:     β_T.
         attack_t:     Fixed timestep used during attack (default 1, near-clean).
+        latent_spatial: Spatial size of the latent feature map.
         wm_bits:      Watermark output dimension (must match Watermarker).
         lambda_wm:    λ used in the original training loss (must match trainer).
     """
@@ -91,6 +93,7 @@ class AttackConfig:
     beta_start: float = 1e-4
     beta_end: float = 0.02
     attack_t: int = 1
+    latent_spatial: int = 8
     wm_bits: int = 64
     lambda_wm: float = 1.0
 
@@ -118,12 +121,14 @@ def _gradient_matching_loss(
         Scalar loss in [0, 2].
     """
     device = target_grads[0].device
-    vec_dummy = torch.cat([
-        g.reshape(-1) for g in dummy_grads if g is not None
-    ])
-    vec_target = torch.cat([
-        g.to(device).reshape(-1) for g in target_grads
-    ])
+    vec_dummy_parts = []
+    for g, t in zip(dummy_grads, target_grads):
+        if g is None:
+            vec_dummy_parts.append(torch.zeros_like(t).reshape(-1))
+        else:
+            vec_dummy_parts.append(g.reshape(-1))
+    vec_dummy = torch.cat(vec_dummy_parts)
+    vec_target = torch.cat([g.to(device).reshape(-1) for g in target_grads])
     # Cosine distance: 0 = perfectly aligned; 2 = opposite
     cos_sim = nn.functional.cosine_similarity(
         vec_dummy.unsqueeze(0), vec_target.unsqueeze(0)
@@ -205,7 +210,10 @@ class GradientInversionAttack:
     # ------------------------------------------------------------------
 
     def _compute_dummy_grads(
-        self, x_dummy: torch.Tensor
+        self,
+        x_dummy: torch.Tensor,
+        t: torch.Tensor,
+        noise: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, tuple[Optional[torch.Tensor], ...]]:
         """Forward-backward pass through the defended pipeline on x_dummy.
 
@@ -225,8 +233,9 @@ class GradientInversionAttack:
         z_prime_dummy = self.permuter(z_dummy)
 
         # Fixed timestep for stable gradient landscape
-        t = self._fixed_t.expand(x_dummy.size(0))
-        z_prime_dummy_t, eps_true = self.schedule.q_sample(z_prime_dummy, t)
+        z_prime_dummy_t, eps_true = self.schedule.q_sample(
+            z_prime_dummy, t, noise=noise
+        )
         eps_pred = self.unet(z_prime_dummy_t, t)
 
         w_hat = self.watermarker(z_prime_dummy)
@@ -274,18 +283,25 @@ class GradientInversionAttack:
         # Move target gradients to attack device
         target_grads_dev = [g.to(self.device) for g in target_grads]
 
-        # ── Initialise dummy image ─────────────────────────────────────
+        # ── Initialise dummy image in a stable [0,1] range ────────────
         if self.config.dummy_init == "random":
-            x_dummy = torch.randn(image_shape, device=self.device)
+            x_init = torch.rand(image_shape, device=self.device)
         else:
-            x_dummy = torch.zeros(image_shape, device=self.device)
+            x_init = torch.full(image_shape, 0.5, device=self.device)
 
-        # Clamp to realistic pixel range [0,1] via sigmoid parameterisation
-        # to avoid unconstrained pixel values during optimisation.
-        # We optimise in logit space: x = sigmoid(x_logit)
-        x_logit = torch.logit(
-            x_dummy.clamp(0.01, 0.99)
-        ).detach().requires_grad_(True)
+        # Optimise in logit space: x = sigmoid(x_logit)
+        x_logit = torch.logit(x_init.clamp(1e-4, 1 - 1e-4)).detach().requires_grad_(True)
+
+        if fixed_noise is None:
+            fixed_noise = torch.randn(
+                image_shape[0],
+                self.vae.encoder.mu_head.out_channels,
+                self.config.latent_spatial,
+                self.config.latent_spatial,
+                device=self.device,
+            )
+        fixed_noise = fixed_noise.to(self.device)
+        t = self._fixed_t.expand(image_shape[0])
 
         # ── Choose optimiser ───────────────────────────────────────────
         if self.config.optimizer == "lbfgs":
@@ -309,7 +325,7 @@ class GradientInversionAttack:
             optimizer.zero_grad()
             x_candidate = torch.sigmoid(x_logit)            # constrained to (0,1)
 
-            _, dummy_grads = self._compute_dummy_grads(x_candidate)
+            _, dummy_grads = self._compute_dummy_grads(x_candidate, t=t, noise=fixed_noise)
 
             loss_match = _gradient_matching_loss(dummy_grads, target_grads_dev)
             loss_tv    = _total_variation(x_candidate)
@@ -355,4 +371,5 @@ class GradientInversionAttack:
             "x_reconstructed": x_reconstructed.detach().cpu(),
             "z_prime_dummy":   z_prime_dummy_final.detach().cpu(),
             "final_loss":      final_loss.cpu(),
+            "x_dummy_final":   x_final.detach().cpu(),
         }

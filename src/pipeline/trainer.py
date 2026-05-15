@@ -390,7 +390,8 @@ class Trainer:
                 "vae_state": self.vae.state_dict(),
                 "unet_state": self.unet.state_dict(),
                 "watermarker_state": self.watermarker.state_dict(),
-                # permuter has no learned params but save buffers for key audit
+                # Key-derived buffers are non-persistent; this stays empty for
+                # new checkpoints and is accepted for old checkpoints.
                 "permuter_state": self.permuter.state_dict(),
                 "optimiser_state": self.optimiser.state_dict(),
                 "w_star": self.w_star.cpu(),
@@ -413,7 +414,7 @@ class Trainer:
         self.vae.load_state_dict(ckpt["vae_state"])
         self.unet.load_state_dict(ckpt["unet_state"])
         self.watermarker.load_state_dict(ckpt["watermarker_state"])
-        self.permuter.load_state_dict(ckpt["permuter_state"])
+        self.permuter.load_state_dict(ckpt.get("permuter_state", {}), strict=False)
         self.optimiser.load_state_dict(ckpt["optimiser_state"])
         self.global_step = ckpt.get("global_step", 0)
         self.w_star = ckpt["w_star"].to(self.device)
@@ -466,7 +467,10 @@ class Trainer:
 
     @torch.no_grad()
     def get_target_gradients(
-        self, x: torch.Tensor
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor | None = None,
+        noise: torch.Tensor | None = None,
     ) -> list[torch.Tensor]:
         """Compute and return the gradients of L_total w.r.t. UNet parameters.
 
@@ -475,6 +479,8 @@ class Trainer:
 
         Args:
             x: A small image batch (B, C, H, W) — typically B=1.
+            t: Optional fixed diffusion timestep for reproducible attacks.
+            noise: Optional fixed diffusion noise matching z_prime shape.
 
         Returns:
             List of gradient tensors, one per UNet parameter, detached and
@@ -493,10 +499,15 @@ class Trainer:
             z_prime = self.permuter(z)
 
             B = x.size(0)
-            t = torch.randint(
-                0, self.config.diffusion_timesteps, (B,), device=self.device
-            )
-            z_prime_t, eps_true = self.schedule.q_sample(z_prime, t)
+            if t is None:
+                t = torch.randint(
+                    0, self.config.diffusion_timesteps, (B,), device=self.device
+                )
+            else:
+                t = t.to(self.device)
+            if noise is not None:
+                noise = noise.to(self.device)
+            z_prime_t, eps_true = self.schedule.q_sample(z_prime, t, noise=noise)
             eps_pred = self.unet(z_prime_t, t)
 
             w_hat = self.watermarker(z_prime)

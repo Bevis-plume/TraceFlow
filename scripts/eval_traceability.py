@@ -61,6 +61,7 @@ from src.crypto.latent_permute import LatentPermuter
 from src.models.unet import UNet
 from src.models.vae import VAE
 from src.models.watermarker import Watermarker, generate_random_watermark
+from src.utils.image import to_vae_input
 from src.utils.metrics import evaluate_reconstruction
 
 logging.basicConfig(
@@ -122,12 +123,23 @@ def restore_models(
     latent_dim = vc["latent_channels"] * vc["latent_spatial"] ** 2
 
     vae = VAE(vc["in_channels"], vc["latent_channels"], vc["base_channels"], vc["kl_weight"])
-    permuter = LatentPermuter(pc["secret_key"], latent_dim, pc["bias_scale"])
-    watermarker = Watermarker(wc["input_dim"], wc["hidden_dims"], wc["output_dim"], wc["dropout"])
+    permuter = LatentPermuter(
+        secret_key=pc["secret_key"],
+        latent_dim=latent_dim,
+        block_size=pc.get("block_size", 16),
+        bias_scale=pc["bias_scale"],
+    )
+    watermarker = Watermarker(
+        input_dim=wc["input_dim"],
+        hidden_dims=wc["hidden_dims"],
+        output_dim=wc["output_dim"],
+        block_size=wc.get("block_size", pc.get("block_size", 16)),
+        dropout=wc["dropout"],
+    )
 
     ckpt = torch.load(checkpoint_path, map_location=device)
     vae.load_state_dict(ckpt["vae_state"])
-    permuter.load_state_dict(ckpt["permuter_state"])
+    permuter.load_state_dict(ckpt.get("permuter_state", {}), strict=False)
     watermarker.load_state_dict(ckpt["watermarker_state"])
 
     # Restore the exact w* used during training
@@ -179,7 +191,7 @@ def extract_watermark_from_image(
     Returns:
         w_hat: Predicted bit probabilities (1, M).
     """
-    image = image.to(device)
+    image = to_vae_input(image).to(device)
 
     # Step 1: encode
     mu, logvar = vae.encode(image)
@@ -317,11 +329,12 @@ def main() -> None:
 
     # ── Metric 4: sanity check on original target image ───────────────
     logger.info("Sanity check: watermark extraction on the original target image…")
-    # Normalise target to match training normalisation before encoding
-    x_target_norm = (x_target * 2.0 - 1.0)   # [0,1] → [−1,1] (training space)
     w_hat_orig = extract_watermark_from_image(
-        x_target_norm.clamp(-1, 1) * 0.5 + 0.5,   # back to [0,1] for encoder
-        vae, permuter, watermarker, device,
+        x_target,
+        vae,
+        permuter,
+        watermarker,
+        device,
     )
     bit_acc_orig = (
         ((w_hat_orig >= 0.5).float() == w_star.unsqueeze(0)).float().mean().item()

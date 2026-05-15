@@ -23,7 +23,6 @@ import sys
 import numpy as np
 import torch
 import torchvision
-import torchvision.transforms as T
 import yaml
 from torch.utils.data import DataLoader
 
@@ -35,6 +34,7 @@ from src.models.unet import UNet
 from src.models.vae import VAE
 from src.models.watermarker import Watermarker
 from src.pipeline.trainer import Trainer, TrainerConfig
+from src.utils.image import cifar10_transform
 
 logging.basicConfig(
     level=logging.INFO,
@@ -96,12 +96,7 @@ def build_dataloader(cfg: dict) -> DataLoader:
     Returns:
         DataLoader yielding (image_tensor, label) pairs; images in [0, 1].
     """
-    transform = T.Compose([
-        T.ToTensor(),                        # [0,1], (C,H,W)
-        T.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),  # → [−1,1]
-    ])
-    # Note: VAE uses Sigmoid output → we normalise here for training stability
-    # but keep images semantically in a known range.
+    transform = cifar10_transform()
 
     dataset = torchvision.datasets.CIFAR10(
         root=cfg["data"]["root"],
@@ -152,6 +147,7 @@ def build_models(cfg: dict) -> tuple[VAE, LatentPermuter, UNet, Watermarker]:
     permuter = LatentPermuter(
         secret_key=pc["secret_key"],
         latent_dim=latent_dim,
+        block_size=pc.get("block_size", 16),
         bias_scale=pc["bias_scale"],
     )
 
@@ -170,6 +166,7 @@ def build_models(cfg: dict) -> tuple[VAE, LatentPermuter, UNet, Watermarker]:
         input_dim=wc["input_dim"],
         hidden_dims=wc["hidden_dims"],
         output_dim=wc["output_dim"],
+        block_size=wc.get("block_size", pc.get("block_size", 16)),
         dropout=wc["dropout"],
     )
 

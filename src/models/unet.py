@@ -103,6 +103,14 @@ class TimeEmbedding(nn.Module):
 # ResBlock with time conditioning
 # ---------------------------------------------------------------------------
 
+def _group_count(channels: int, max_groups: int = 32) -> int:
+    """Return the largest GroupNorm group count that divides channels."""
+    for groups in range(min(max_groups, channels), 0, -1):
+        if channels % groups == 0:
+            return groups
+    return 1
+
+
 class ResBlockTime(nn.Module):
     """Pre-activation residual block conditioned on a time embedding τ.
 
@@ -126,7 +134,7 @@ class ResBlockTime(nn.Module):
     ) -> None:
         super().__init__()
 
-        self.norm1 = nn.GroupNorm(min(32, in_channels), in_channels)
+        self.norm1 = nn.GroupNorm(_group_count(in_channels), in_channels)
         self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
 
         self.time_proj = nn.Sequential(
@@ -134,7 +142,7 @@ class ResBlockTime(nn.Module):
             nn.Linear(time_embed_dim, out_channels),
         )
 
-        self.norm2 = nn.GroupNorm(min(32, out_channels), out_channels)
+        self.norm2 = nn.GroupNorm(_group_count(out_channels), out_channels)
         self.dropout = nn.Dropout2d(dropout)
         self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
 
@@ -293,7 +301,7 @@ class UNet(nn.Module):
         # Output projection
         # ----------------------------------------------------------------
         self.output_proj = nn.Sequential(
-            nn.GroupNorm(min(32, in_ch), in_ch),
+            nn.GroupNorm(_group_count(in_ch), in_ch),
             nn.SiLU(),
             nn.Conv2d(in_ch, in_channels, kernel_size=3, padding=1),
         )
