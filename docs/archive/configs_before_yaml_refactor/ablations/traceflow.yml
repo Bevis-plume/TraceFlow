@@ -1,0 +1,80 @@
+project:
+  name: traceflow-full
+  seed: 42
+  device: auto
+  output_dir: outputs/flow_transformer
+data:
+  name: imagefolder
+  root: ./data/images
+  image_size: 256
+  num_workers: 8
+  pin_memory: true
+  download: false
+autoencoder:
+  backend: local
+  pretrained_model_name_or_path: null
+  freeze: true
+  latent_channels: 4
+  latent_size: 32
+  scaling_factor: 1.0
+  base_channels: 64
+model:
+  preset: DiT-S
+  latent_channels: 4
+  latent_size: 32
+  patch_size: 2
+  hidden_size: 512
+  depth: 12
+  num_heads: 8
+  mlp_ratio: 4.0
+  dropout: 0.0
+  class_conditional: false
+  num_classes: null
+training:
+  batch_size: 8
+  grad_accum_steps: 4
+  num_steps: 100000
+  learning_rate: 0.0001
+  weight_decay: 0.01
+  warmup_steps: 1000
+  ema_decay: 0.9999
+  mixed_precision: bf16
+  log_interval: 50
+  sample_interval: 1000
+  save_interval: 5000
+  checkpoint_dir: checkpoints/flow_transformer
+sampling:
+  sampler: euler
+  steps: 50
+  num_samples: 16
+smoke:
+  image_size: 64
+  batch_size: 2
+  latent_channels: 4
+  latent_size: 8
+  model_preset: DiT-XS
+  steps: 2
+security:
+  latent_transform:
+    type: keyed
+    secret_key: FULL_TRACEFLOW_KEY_CHANGE_ME
+    block_size: 16
+    bias_scale: 0.1
+watermark:
+  enabled: true
+  type: traceflow
+  bit_length: 32
+  seed: 1234
+  alpha: 0.02
+  extractor_hidden_dim: 128
+  latent_channels: 4
+  latent_detector_hidden_dim: 64
+  message_mode: random_per_sample
+  lambda_wm_img: 1.0
+  lambda_wm_latent: 0.5
+  lambda_img: 0.1
+  lambda_cycle: 0.1
+  lambda_residual: 0.01
+  cycle_target: protected_latent
+  save_bits: true
+  detection_threshold_acc: 0.9

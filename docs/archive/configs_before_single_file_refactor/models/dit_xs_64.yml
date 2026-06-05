@@ -1,0 +1,27 @@
+# Tiny model for smoke tests.
+autoencoder:
+  latent_channels: 4
+  latent_size: 8
+model:
+  preset: DiT-XS
+  latent_channels: 4
+  latent_size: 8
+  patch_size: 2
+  hidden_size: 128
+  depth: 4
+  num_heads: 4
+  mlp_ratio: 4.0
+  dropout: 0.0
+  class_conditional: false
+  num_classes: null
+sampling:
+  sampler: euler
+  steps: 2
+  num_samples: 4
+smoke:
+  image_size: 64
+  batch_size: 2
+  latent_channels: 4
+  latent_size: 8
+  model_preset: DiT-XS
+  steps: 2

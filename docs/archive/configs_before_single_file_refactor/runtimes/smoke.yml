@@ -1,0 +1,16 @@
+project:
+  device: auto
+# Fast code-path check.
+training:
+  batch_size: 2
+  grad_accum_steps: 1
+  num_steps: 3
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  warmup_steps: 0
+  ema_decay: 0.9999
+  mixed_precision: none
+  log_interval: 1
+  sample_interval: 1
+  save_interval: 3
+  checkpoint_dir: checkpoints/flow_transformer

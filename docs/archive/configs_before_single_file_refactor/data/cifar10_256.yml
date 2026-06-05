@@ -1,0 +1,14 @@
+# CIFAR-10 resized/cropped to 256 for fast pipeline validation.
+data:
+  name: cifar10
+  root: ./data
+  image_size: 256
+  num_workers: 8
+  pin_memory: true
+  download: false
+autoencoder:
+  backend: diffusers
+  pretrained_model_name_or_path: pretrained/sd-vae-ft-mse
+  freeze: true
+  scaling_factor: 0.18215
+  base_channels: 64

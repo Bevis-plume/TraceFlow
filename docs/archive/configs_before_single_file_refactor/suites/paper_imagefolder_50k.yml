@@ -1,0 +1,32 @@
+suite:
+  name: traceflow-imagefolder-50k
+  output_dir: results/traceflow_imagefolder_50k
+  figures: true
+  readiness: true
+  mode: full
+common:
+  data: configs/data/imagefolder_256.yml
+  model: configs/models/dit_s_256.yml
+  runtime: configs/runtimes/pilot_50k.yml
+  vae_path: stabilityai/sd-vae-ft-mse
+  secret_key: CHANGE_ME_IN_LOCAL_COPY
+experiments:
+  exp01:
+    method: configs/methods/baseline.yml
+    run_name: traceflow-imagefolder50k-exp01-baseline
+  exp02:
+    method: configs/methods/keyed.yml
+    run_name: traceflow-imagefolder50k-exp02-keyed
+  exp03:
+    method: configs/methods/traceflow_identity.yml
+    run_name: traceflow-imagefolder50k-exp03-identity
+  exp04:
+    method: configs/methods/traceflow.yml
+    run_name: traceflow-imagefolder50k-exp04-traceflow
+    attack: latent
+    attack_steps: 100
+    attacker: no_key
+  exp05:
+    method: configs/methods/traceflow.yml
+    run_name: traceflow-imagefolder50k-exp05-robustness
+    attack_steps: 100

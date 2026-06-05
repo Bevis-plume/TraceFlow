@@ -1,0 +1,13 @@
+# TraceFlow method fragment: generation baseline.
+project:
+  seed: 42
+  device: cuda
+  output_dir: outputs/flow_transformer
+security:
+  latent_transform:
+    type: identity
+    secret_key: UNUSED_FOR_IDENTITY
+    block_size: 16
+    bias_scale: 0.1
+watermark:
+  enabled: false

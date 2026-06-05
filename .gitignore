@@ -1,8 +1,36 @@
-checkpoints/
+# Generated at runtime — do not commit
+/outputs/
+/checkpoints/
+/data/
+/results/
+/attack_outputs/
+wandb/
+
+# Model weights
 *.pt
-data/
-attack_outputs/
+*.pth
+*.ckpt
+
+# Python cache
 __pycache__/
 *.pyc
+*.pyo
+.pytest_cache/
+
+# Results / experiment outputs
 results/
 image.png
+
+# macOS
+**/.DS_Store
+
+# Editor
+.vscode/
+*.swp
+
+# Reference repositories (read-only architectural references; cloned locally, not tracked)
+references/
+
+local_configs/
+
+logs/

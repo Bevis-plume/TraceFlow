@@ -1,5 +1,5 @@
 # =============================================================================
-# Trackable Latent Diffusion — Python Dependencies
+# TraceFlow — Python Dependencies
 # =============================================================================
 # Install with:  pip install -r requirements.txt
 # Tested on Python 3.10 / 3.11, CUDA 11.8 / 12.1
@@ -23,6 +23,13 @@ scikit-image>=0.22.0
 # --- Visualisation ---
 matplotlib>=3.8.0
 Pillow>=10.2.0
+
+# --- CUDA / full-run dependencies ---
+# Required for diffusers AutoencoderKL-based CUDA experiments.
+diffusers>=0.30.0
+transformers>=4.44.0
+accelerate>=0.34.0
+safetensors>=0.4.4
 
 # --- Experiment tracking (optional) ---
 # Uncomment if using Weights & Biases:

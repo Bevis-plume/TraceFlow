@@ -1,0 +1,90 @@
+# =============================================================================
+# TraceFlow — Ablation: Baseline (no latent transform)
+# =============================================================================
+# Use this config to train the baseline model with an identity latent transform.
+# The FlowTransformer trains directly on z = ae.encode(x) without any keying.
+#
+# Smoke test:
+#   python -m scripts.train_flow_transformer --config configs/ablations/baseline.yml --smoke
+# =============================================================================
+
+project:
+  name: traceflow-baseline
+  seed: 42
+  device: auto
+  output_dir: outputs/flow_transformer
+
+data:
+  name: imagefolder
+  root: ./data/images
+  image_size: 256
+  num_workers: 8
+  pin_memory: true
+  download: false
+
+autoencoder:
+  backend: local
+  pretrained_model_name_or_path: null
+  freeze: true
+  latent_channels: 4
+  latent_size: 32
+  scaling_factor: 1.0
+  base_channels: 64
+
+model:
+  preset: DiT-S
+  latent_channels: 4
+  latent_size: 32
+  patch_size: 2
+  hidden_size: 512
+  depth: 12
+  num_heads: 8
+  mlp_ratio: 4.0
+  dropout: 0.0
+  class_conditional: false
+  num_classes: null
+
+training:
+  batch_size: 8
+  grad_accum_steps: 4
+  num_steps: 100000
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  warmup_steps: 1000
+  ema_decay: 0.9999
+  mixed_precision: bf16
+  log_interval: 50
+  sample_interval: 1000
+  save_interval: 5000
+  checkpoint_dir: checkpoints/flow_transformer
+
+sampling:
+  sampler: euler
+  steps: 50
+  num_samples: 16
+
+smoke:
+  image_size: 64
+  batch_size: 2
+  latent_channels: 4
+  latent_size: 8
+  model_preset: DiT-XS
+  steps: 2
+
+# -----------------------------------------------------------------------------
+# Security: identity (no latent transform)
+# No keying is applied; the model trains on raw autoencoder latents.
+# This is the baseline against which keyed and watermarked variants are compared.
+# -----------------------------------------------------------------------------
+security:
+  latent_transform:
+    type: identity
+    secret_key: UNUSED_FOR_IDENTITY
+    block_size: 16
+    bias_scale: 0.1
+
+# -----------------------------------------------------------------------------
+# Decoder watermark — disabled for the baseline ablation.
+# -----------------------------------------------------------------------------
+watermark:
+  enabled: false

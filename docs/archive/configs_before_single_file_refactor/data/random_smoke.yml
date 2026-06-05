@@ -1,0 +1,14 @@
+# Random tensors for code-path smoke tests only.
+data:
+  name: random
+  root: ./data
+  image_size: 64
+  num_workers: 0
+  pin_memory: false
+  download: false
+autoencoder:
+  backend: local
+  pretrained_model_name_or_path: null
+  freeze: true
+  scaling_factor: 1.0
+  base_channels: 32

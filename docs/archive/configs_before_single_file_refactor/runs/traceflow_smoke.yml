@@ -1,0 +1,14 @@
+run:
+  name: traceflow-smoke
+  output_dir: outputs/flow_transformer
+  checkpoint_dir: checkpoints/flow_transformer
+compose:
+  method: configs/methods/traceflow.yml
+  data: configs/data/random_smoke.yml
+  model: configs/models/dit_xs_64.yml
+  runtime: configs/runtimes/smoke.yml
+security:
+  secret_key: TRACEFLOW_SMOKE_KEY
+postprocess:
+  sample: true
+  training_figures: true

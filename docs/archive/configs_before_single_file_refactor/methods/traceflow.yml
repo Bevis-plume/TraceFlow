@@ -1,0 +1,29 @@
+# TraceFlow method fragment: keyed latent transform plus dual-head watermark.
+project:
+  seed: 42
+  device: cuda
+  output_dir: outputs/flow_transformer
+security:
+  latent_transform:
+    type: keyed
+    secret_key: CHANGE_ME_IN_LOCAL_COPY
+    block_size: 16
+    bias_scale: 0.1
+watermark:
+  enabled: true
+  type: traceflow
+  bit_length: 32
+  seed: 1234
+  alpha: 0.02
+  extractor_hidden_dim: 128
+  latent_channels: 4
+  latent_detector_hidden_dim: 64
+  message_mode: random_per_sample
+  lambda_wm_img: 1.0
+  lambda_wm_latent: 0.5
+  lambda_img: 0.1
+  lambda_cycle: 0.1
+  lambda_residual: 0.01
+  cycle_target: protected_latent
+  save_bits: true
+  detection_threshold_acc: 0.9

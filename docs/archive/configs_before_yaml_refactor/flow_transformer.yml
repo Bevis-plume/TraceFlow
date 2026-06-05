@@ -1,0 +1,103 @@
+# =============================================================================
+# TraceFlow — Flow Transformer Configuration
+# TraceFlow: Traceable Rectified Flow Transformers Against Generative Model Inversion
+# =============================================================================
+
+project:
+  name: traceflow
+  seed: 42
+  device: auto                    # "auto" | "cuda" | "cpu" | "mps"
+  output_dir: outputs/flow_transformer
+
+# -----------------------------------------------------------------------------
+# Data
+# -----------------------------------------------------------------------------
+data:
+  name: imagefolder               # "imagefolder" | "cifar10" | "flat" | "random"
+  root: ./data/images
+  image_size: 256
+  num_workers: 8
+  pin_memory: true
+  download: false
+
+# -----------------------------------------------------------------------------
+# Autoencoder
+# -----------------------------------------------------------------------------
+autoencoder:
+  backend: local                  # "local" | "diffusers"
+  pretrained_model_name_or_path: null
+  freeze: true
+  latent_channels: 4
+  latent_size: 32                 # latent H = W = 32  (for 256x256 images, 8x downsample)
+  scaling_factor: 1.0
+  base_channels: 64
+
+# -----------------------------------------------------------------------------
+# Model
+# -----------------------------------------------------------------------------
+model:
+  preset: DiT-S                   # "DiT-XS" | "DiT-S" | "DiT-B" | null (use explicit params)
+  latent_channels: 4
+  latent_size: 32
+  patch_size: 2
+  hidden_size: 512                # overridden by preset
+  depth: 12                       # overridden by preset
+  num_heads: 8                    # overridden by preset
+  mlp_ratio: 4.0
+  dropout: 0.0
+  class_conditional: false
+  num_classes: null
+
+# -----------------------------------------------------------------------------
+# Training
+# -----------------------------------------------------------------------------
+training:
+  batch_size: 8
+  grad_accum_steps: 4
+  num_steps: 100000
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  warmup_steps: 1000
+  ema_decay: 0.9999
+  mixed_precision: bf16           # "bf16" | "fp16" | "none"
+  log_interval: 50
+  sample_interval: 1000
+  save_interval: 5000
+  checkpoint_dir: checkpoints/flow_transformer
+
+# -----------------------------------------------------------------------------
+# Sampling
+# -----------------------------------------------------------------------------
+sampling:
+  sampler: euler                  # "euler" | "heun"
+  steps: 50
+  num_samples: 16
+
+# -----------------------------------------------------------------------------
+# Smoke mode overrides
+# Applied when --smoke flag is passed to the training/sampling scripts.
+# -----------------------------------------------------------------------------
+smoke:
+  image_size: 64
+  batch_size: 2
+  latent_channels: 4
+  latent_size: 8
+  model_preset: DiT-XS
+  steps: 2
+
+# -----------------------------------------------------------------------------
+# Security / Latent Transform
+# -----------------------------------------------------------------------------
+security:
+  latent_transform:
+    type: identity              # "identity" (baseline no-op) | "keyed"
+    secret_key: DEV_ONLY_CHANGE_ME   # only used when type=keyed
+    block_size: 16
+    bias_scale: 0.1
+
+# -----------------------------------------------------------------------------
+# TraceFlow watermark — disabled by default.
+# -----------------------------------------------------------------------------
+watermark:
+  enabled: false
+  type: traceflow

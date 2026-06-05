@@ -1,0 +1,80 @@
+project:
+  seed: 42
+  device: cuda
+  output_dir: outputs/flow_transformer
+  name: traceflow-imagefolder400k-exp03-identity
+security:
+  latent_transform:
+    type: identity
+    secret_key: UNUSED_FOR_IDENTITY
+    block_size: 16
+    bias_scale: 0.1
+watermark:
+  enabled: true
+  type: traceflow
+  bit_length: 32
+  seed: 1234
+  alpha: 0.02
+  extractor_hidden_dim: 128
+  latent_channels: 4
+  latent_detector_hidden_dim: 64
+  message_mode: random_per_sample
+  lambda_wm_img: 1.0
+  lambda_wm_latent: 0.5
+  lambda_img: 0.1
+  lambda_cycle: 0.1
+  lambda_residual: 0.01
+  cycle_target: protected_latent
+  save_bits: true
+  detection_threshold_acc: 0.9
+data:
+  name: imagefolder
+  root: ./data/images_256
+  image_size: 256
+  num_workers: 8
+  pin_memory: true
+  download: false
+autoencoder:
+  backend: diffusers
+  pretrained_model_name_or_path: stabilityai/sd-vae-ft-mse
+  freeze: true
+  scaling_factor: 0.18215
+  base_channels: 64
+  latent_channels: 4
+  latent_size: 32
+model:
+  preset: DiT-S
+  latent_channels: 4
+  latent_size: 32
+  patch_size: 2
+  hidden_size: 512
+  depth: 12
+  num_heads: 8
+  mlp_ratio: 4.0
+  dropout: 0.0
+  class_conditional: false
+  num_classes: null
+sampling:
+  sampler: euler
+  steps: 50
+  num_samples: 16
+smoke:
+  image_size: 64
+  batch_size: 2
+  latent_channels: 4
+  latent_size: 8
+  model_preset: DiT-XS
+  steps: 2
+training:
+  batch_size: 16
+  grad_accum_steps: 4
+  num_steps: 400000
+  learning_rate: 0.0001
+  weight_decay: 0.01
+  warmup_steps: 5000
+  ema_decay: 0.9999
+  mixed_precision: bf16
+  log_interval: 100
+  sample_interval: 5000
+  save_interval: 10000
+  checkpoint_dir: checkpoints/flow_transformer

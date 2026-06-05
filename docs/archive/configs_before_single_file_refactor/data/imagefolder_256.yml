@@ -1,0 +1,14 @@
+# Paper-scale image folder dataset. Expected layout: root/class_or_bucket/*.jpg.
+data:
+  name: imagefolder
+  root: ./data/images_256
+  image_size: 256
+  num_workers: 8
+  pin_memory: true
+  download: false
+autoencoder:
+  backend: diffusers
+  pretrained_model_name_or_path: stabilityai/sd-vae-ft-mse
+  freeze: true
+  scaling_factor: 0.18215
+  base_channels: 64

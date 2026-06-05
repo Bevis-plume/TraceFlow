@@ -1,0 +1,159 @@
+# TraceFlow single-file configuration.
+# Edit this file for normal training and experiments. You should not need to
+# choose between many YAML files anymore.
+
+traceflow:
+  name: traceflow-cifar-50k
+  mode: full                 # smoke | full
+  output_dir: results/traceflow_cifar_50k
+  figures: true
+  readiness: true
+  training_figures: true
+
+artifact_bundle:
+  # On AutoDL/server runs, prefer the data disk:
+  #   /root/autodl-tmp/traceflow_runs/<run_name>
+  # For local development this relative default keeps artifacts in the repo.
+  root: runs/traceflow-cifar-50k
+
+runtime:
+  detach_default: false       # set true on server if you usually want nohup background runs
+  make_archive: false         # optional .tar.gz packaging after a foreground run
+
+entries:
+  check_ready:
+    run_name: traceflow-cifar50k-preflight
+  train_generator:
+    run_name: traceflow-cifar50k-generator
+  train_final:
+    run_name: traceflow-cifar50k-final
+  run_all:
+    run_name: traceflow-cifar50k-paper-all
+
+project:
+  name: traceflow-cifar-50k
+  seed: 42
+  device: cuda               # use auto for local smoke on Mac/CPU
+  output_dir: outputs/flow_transformer
+
+data:
+  name: cifar10              # random | cifar10 | imagefolder | flat
+  root: ./data               # for imagefolder, set to ./data/images_256 or your dataset path
+  image_size: 256
+  num_workers: 8
+  pin_memory: true
+  download: false
+
+autoencoder:
+  backend: diffusers         # local | diffusers
+  pretrained_model_name_or_path: pretrained/sd-vae-ft-mse
+  freeze: true
+  latent_channels: 4
+  latent_size: 32
+  scaling_factor: 0.18215
+  base_channels: 64
+
+model:
+  preset: DiT-S              # DiT-XS | DiT-S | DiT-B
+  latent_channels: 4
+  latent_size: 32
+  patch_size: 2
+  hidden_size: 512
+  depth: 12
+  num_heads: 8
+  mlp_ratio: 4.0
+  dropout: 0.0
+  class_conditional: false
+  num_classes: null
+
+training:
+  # Balanced RTX 5090 default. This uses more memory per optimizer step than
+  # 16x4 while keeping enough headroom for the full TraceFlow VAE/watermark path.
+  batch_size: 24
+  grad_accum_steps: 3
+  num_steps: 50000           # change this to 5000 / 20000 / 50000 / 400000 as needed
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  warmup_steps: 5000
+  ema_decay: 0.9999
+  mixed_precision: bf16      # none | bf16 | fp16
+  log_interval: 50
+  sample_interval: 5000
+  save_interval: 10000
+  checkpoint_dir: checkpoints/flow_transformer
+
+sampling:
+  sampler: euler
+  steps: 50
+  num_samples: 16
+
+# Used only when `traceflow.mode: smoke` or CLI --smoke is set.
+smoke:
+  image_size: 64
+  batch_size: 2
+  latent_channels: 4
+  latent_size: 8
+  model_preset: DiT-XS
+  steps: 2
+
+security:
+  latent_transform:
+    type: keyed              # exp01/exp03 override this to identity automatically
+    secret_key: CHANGE_ME_IN_LOCAL_COPY
+    block_size: 16
+    bias_scale: 0.1
+
+watermark:
+  enabled: true              # exp01/exp02 disable this automatically
+  type: traceflow
+  bit_length: 32
+  seed: 1234
+  alpha: 0.02
+  extractor_hidden_dim: 128
+  latent_channels: 4
+  latent_detector_hidden_dim: 64
+  message_mode: random_per_sample
+  lambda_wm_img: 1.0
+  lambda_wm_latent: 0.5
+  lambda_img: 0.1
+  lambda_cycle: 0.1
+  lambda_residual: 0.01
+  cycle_target: protected_latent
+  save_bits: true
+  detection_threshold_acc: 0.9
+
+# Standard paper matrix. All experiments inherit the top-level parameters above;
+# only method semantics and attack settings differ.
+experiments:
+  exp01:
+    enabled: true
+    method: baseline
+    run_name: traceflow-cifar50k-exp01-baseline
+
+  exp02:
+    enabled: true
+    method: keyed
+    run_name: traceflow-cifar50k-exp02-keyed
+
+  exp03:
+    enabled: true
+    method: traceflow_identity
+    run_name: traceflow-cifar50k-exp03-identity
+
+  exp04:
+    enabled: true
+    method: traceflow
+    run_name: traceflow-cifar50k-exp04-traceflow
+    attack: latent
+    attack_steps: 100
+    attacker: no_key
+
+  exp05:
+    enabled: true
+    method: traceflow
+    run_name: traceflow-cifar50k-exp05-robustness
+    attack_steps: 100
+
+postprocess:
+  sample: true
+  training_figures: true

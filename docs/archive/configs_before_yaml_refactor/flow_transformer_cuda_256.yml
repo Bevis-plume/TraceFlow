@@ -1,0 +1,120 @@
+# =============================================================================
+# TraceFlow — CUDA Training Config (256×256, DiT-S)
+# =============================================================================
+# PURPOSE: Production training template for a Windows/Linux CUDA machine.
+#          Do NOT run this config on Mac — use configs/flow_transformer.yml for
+#          local development and smoke tests only.
+#
+# BEFORE RUNNING:
+#   1. Set data.root to your local 256×256 image folder path.
+#   2. Set autoencoder.pretrained_model_name_or_path to the diffusers VAE checkpoint
+#      you want to use (e.g. "stabilityai/sd-vae-ft-mse").
+#   3. (Optional) set project.name to distinguish W&B / output runs.
+#
+# Usage:
+#   python -m scripts.train_flow_transformer \
+#     --config configs/flow_transformer_cuda_256.yml \
+#     --run-name my_run_256
+# =============================================================================
+
+project:
+  name: traceflow-cuda-256
+  seed: 42
+  device: cuda
+  output_dir: outputs/flow_transformer
+
+# -----------------------------------------------------------------------------
+# Data
+# -----------------------------------------------------------------------------
+data:
+  name: imagefolder               # point to a folder of 256×256 images
+  root: ./data/images_256         # CONFIGURE: path to your dataset
+  image_size: 256
+  num_workers: 8
+  pin_memory: true
+  download: false
+
+# -----------------------------------------------------------------------------
+# Autoencoder  (pretrained diffusers VAE — required for real training)
+# -----------------------------------------------------------------------------
+# NOTE: The local autoencoder is random-init and only suitable for smoke tests.
+#       For real training use a pretrained AutoencoderKL from diffusers.
+#       Example checkpoint: "stabilityai/sd-vae-ft-mse"
+#       The checkpoint will be downloaded from Hugging Face on first use.
+autoencoder:
+  backend: diffusers
+  pretrained_model_name_or_path: stabilityai/sd-vae-ft-mse  # CONFIGURE as needed
+  freeze: true
+  latent_channels: 4
+  latent_size: 32                 # 256 / 8 = 32 (sd-vae-ft-mse downsamples 8×)
+  scaling_factor: 0.18215         # standard sd-vae-ft-mse scaling factor
+  base_channels: 64               # unused for diffusers backend
+
+# -----------------------------------------------------------------------------
+# Model
+# -----------------------------------------------------------------------------
+model:
+  preset: DiT-S                   # "DiT-XS" | "DiT-S" | "DiT-B" | null
+  latent_channels: 4
+  latent_size: 32
+  patch_size: 2
+  hidden_size: 512                # overridden by preset DiT-S
+  depth: 12                       # overridden by preset DiT-S
+  num_heads: 8                    # overridden by preset DiT-S
+  mlp_ratio: 4.0
+  dropout: 0.0
+  class_conditional: false
+  num_classes: null
+
+# -----------------------------------------------------------------------------
+# Training
+# -----------------------------------------------------------------------------
+training:
+  batch_size: 16                  # per-GPU batch; effective batch = batch_size * grad_accum_steps
+  grad_accum_steps: 4             # effective batch = 64
+  num_steps: 400000
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  warmup_steps: 5000
+  ema_decay: 0.9999
+  mixed_precision: bf16           # A100/H100 BF16; use fp16 for older CUDA GPUs
+  log_interval: 100
+  sample_interval: 5000
+  save_interval: 10000
+  checkpoint_dir: checkpoints/flow_transformer
+
+# -----------------------------------------------------------------------------
+# Sampling
+# -----------------------------------------------------------------------------
+sampling:
+  sampler: euler                  # "euler" | "heun"
+  steps: 50
+  num_samples: 16
+
+# -----------------------------------------------------------------------------
+# Smoke overrides (not used in CUDA config; included for script compatibility)
+# -----------------------------------------------------------------------------
+smoke:
+  image_size: 64
+  batch_size: 2
+  latent_channels: 4
+  latent_size: 8
+  model_preset: DiT-XS
+  steps: 2
+
+# -----------------------------------------------------------------------------
+# Security / Latent Transform
+# -----------------------------------------------------------------------------
+security:
+  latent_transform:
+    type: identity              # "identity" (baseline no-op) | "keyed"
+    secret_key: CHANGE_ME_FOR_REAL_RUNS  # only used when type=keyed; use a strong random string
+    block_size: 16
+    bias_scale: 0.1
+
+# -----------------------------------------------------------------------------
+# TraceFlow watermark — disabled by default.
+# -----------------------------------------------------------------------------
+watermark:
+  enabled: false
+  type: traceflow

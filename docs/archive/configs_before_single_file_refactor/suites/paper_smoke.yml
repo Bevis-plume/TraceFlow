@@ -1,0 +1,32 @@
+suite:
+  name: traceflow-smoke-suite
+  output_dir: results/traceflow_cli_smoke
+  figures: true
+  readiness: true
+  mode: smoke
+common:
+  data: configs/data/random_smoke.yml
+  model: configs/models/dit_xs_64.yml
+  runtime: configs/runtimes/smoke.yml
+  vae_path: null
+  secret_key: TRACEFLOW_SMOKE_KEY
+experiments:
+  exp01:
+    method: configs/methods/baseline.yml
+    run_name: traceflow-smoke-exp01-baseline
+  exp02:
+    method: configs/methods/keyed.yml
+    run_name: traceflow-smoke-exp02-keyed
+  exp03:
+    method: configs/methods/traceflow_identity.yml
+    run_name: traceflow-smoke-exp03-identity
+  exp04:
+    method: configs/methods/traceflow.yml
+    run_name: traceflow-smoke-exp04-traceflow
+    attack: latent
+    attack_steps: 3
+    attacker: no_key
+  exp05:
+    method: configs/methods/traceflow.yml
+    run_name: traceflow-smoke-exp05-robustness
+    attack_steps: 3

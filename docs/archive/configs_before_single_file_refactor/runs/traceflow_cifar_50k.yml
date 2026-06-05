@@ -1,0 +1,14 @@
+run:
+  name: traceflow-cifar-50k
+  output_dir: outputs/flow_transformer
+  checkpoint_dir: checkpoints/flow_transformer
+compose:
+  method: configs/methods/traceflow.yml
+  data: configs/data/cifar10_256.yml
+  model: configs/models/dit_s_256.yml
+  runtime: configs/runtimes/pilot_50k.yml
+security:
+  secret_key: CHANGE_ME_IN_LOCAL_COPY
+postprocess:
+  sample: true
+  training_figures: true
