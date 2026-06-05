@@ -184,6 +184,9 @@ def train(args: argparse.Namespace) -> None:
 
     device = _resolve_device(cfg["project"].get("device", "auto"))
     print(f"[train] Device: {device}")
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision(cfg["training"].get("matmul_precision", "high"))
 
     # Determine run name and isolated per-run directories.
     # An explicit --run-name always wins.  In smoke mode the default is "smoke"
@@ -322,7 +325,7 @@ def train(args: argparse.Namespace) -> None:
         extractor = watermark["extractor"]
         latent_detector = watermark["latent_detector"]
         wm_bits = watermark["bits"]
-        bce_loss = nn.BCELoss()
+        bce_loss = nn.BCEWithLogitsLoss()
         print(
             f"[train] Watermark: ENABLED | type={wm_type} bits={wm_cfg['bit_length']} "
             f"alpha={wm_cfg['alpha']} lambda_wm_img={wm_cfg['lambda_wm_img']} "
@@ -353,11 +356,17 @@ def train(args: argparse.Namespace) -> None:
         opt_params += list(decoder_adapter.parameters())
         opt_params += list(latent_detector.parameters())
 
-    optimizer = torch.optim.AdamW(
-        opt_params,
-        lr=cfg["training"]["learning_rate"],
-        weight_decay=cfg["training"].get("weight_decay", 0.01),
-    )
+    adamw_kwargs = {
+        "lr": cfg["training"]["learning_rate"],
+        "weight_decay": cfg["training"].get("weight_decay", 0.01),
+    }
+    if device.type == "cuda" and cfg["training"].get("fused_optimizer", True):
+        adamw_kwargs["fused"] = True
+    try:
+        optimizer = torch.optim.AdamW(opt_params, **adamw_kwargs)
+    except TypeError:
+        adamw_kwargs.pop("fused", None)
+        optimizer = torch.optim.AdamW(opt_params, **adamw_kwargs)
     scaler = _build_scaler(mixed_precision, device)
 
     # ------------------------------------------------------------------
@@ -379,6 +388,7 @@ def train(args: argparse.Namespace) -> None:
     sample_interval = cfg["training"]["sample_interval"]
     save_interval = cfg["training"]["save_interval"]
     warmup_steps = cfg["training"].get("warmup_steps", 0)
+    clean_fp_interval = int(cfg["training"].get("clean_fp_interval", 500))
 
     model.train()
     autoencoder.eval()
@@ -405,6 +415,7 @@ def train(args: argparse.Namespace) -> None:
     # traceflow clean false-positive accumulators
     accum_clean_bitacc_img = 0.0
     accum_clean_bitacc_latent = 0.0
+    accum_clean_count = 0
     t0 = time.time()
 
     data_iter = iter(loader)
@@ -457,26 +468,34 @@ def train(args: argparse.Namespace) -> None:
                     z_hat = latent_transform.invert(z_hat_k)
                     x_hat = autoencoder.decode_with_grad(z_hat)
 
-                    _owner_bits_b = expand_bits(wm_bits, x.size(0)).to(device)
-                    with torch.no_grad():
-                        _clean_img_probs = extractor(x_hat.detach())
-                        clean_bitacc_img_step = bit_accuracy(_clean_img_probs, _owner_bits_b)
-                        _z_clean_k = latent_transform(autoencoder.encode(x_hat.detach()))
-                        _clean_lat_probs = latent_detector(_z_clean_k)
-                        clean_bitacc_lat_step = bit_accuracy(_clean_lat_probs, _owner_bits_b)
+                    should_check_clean_fp = (
+                        clean_fp_interval > 0
+                        and (step + 1) % clean_fp_interval == 0
+                        and _sub == grad_accum - 1
+                    )
+                    if should_check_clean_fp:
+                        _owner_bits_b = expand_bits(wm_bits, x.size(0)).to(device)
+                        with torch.no_grad():
+                            _clean_img_probs = extractor(x_hat.detach())
+                            clean_bitacc_img_step = bit_accuracy(_clean_img_probs, _owner_bits_b)
+                            _z_clean_k = latent_transform(autoencoder.encode(x_hat.detach()))
+                            _clean_lat_probs = latent_detector(_z_clean_k)
+                            clean_bitacc_lat_step = bit_accuracy(_clean_lat_probs, _owner_bits_b)
 
                     residual = decoder_adapter(x_hat, bits)
                     x_w = torch.clamp(x_hat + wm_cfg["alpha"] * residual, -1.0, 1.0)
                     residual_l = residual.pow(2).mean()
 
-                    bit_probs = extractor(x_w)
-                    wm_l = bce_loss(bit_probs, bits)
+                    bit_logits = extractor.logits(x_w)
+                    wm_l = bce_loss(bit_logits, bits)
+                    bit_probs = torch.sigmoid(bit_logits)
                     img_l = nn.functional.mse_loss(x_w, x_hat.detach())
 
                     z_re = autoencoder.encode_with_grad(x_w)
                     z_re_k = latent_transform(z_re)
-                    bit_probs_latent = latent_detector(z_re_k)
-                    wm_latent_l = bce_loss(bit_probs_latent, bits)
+                    bit_logits_latent = latent_detector.logits(z_re_k)
+                    wm_latent_l = bce_loss(bit_logits_latent, bits)
+                    bit_probs_latent = torch.sigmoid(bit_logits_latent)
                     cycle_l = nn.functional.mse_loss(z_re_k, z_hat_k.detach())
 
                     sub_loss = (
@@ -516,6 +535,7 @@ def train(args: argparse.Namespace) -> None:
                 if clean_bitacc_img_step is not None:
                     accum_clean_bitacc_img += clean_bitacc_img_step
                     accum_clean_bitacc_latent += clean_bitacc_lat_step
+                    accum_clean_count += 1
 
         accum_loss += step_loss / grad_accum  # average loss for this optimizer step
         accum_count += 1
@@ -558,8 +578,9 @@ def train(args: argparse.Namespace) -> None:
                 record["ber_img"] = accum_ber / n_sub
                 record["bit_acc_latent"] = accum_bitacc_latent / n_sub
                 record["ber_latent"] = accum_ber_latent / n_sub
-                record["clean_false_positive_img"] = accum_clean_bitacc_img / n_sub
-                record["clean_false_positive_latent"] = accum_clean_bitacc_latent / n_sub
+                if accum_clean_count > 0:
+                    record["clean_false_positive_img"] = accum_clean_bitacc_img / accum_clean_count
+                    record["clean_false_positive_latent"] = accum_clean_bitacc_latent / accum_clean_count
             _log_metrics(log_path, record)
             if watermark is not None:
                 print(
@@ -589,6 +610,7 @@ def train(args: argparse.Namespace) -> None:
             accum_ber_latent = 0.0
             accum_clean_bitacc_img = 0.0
             accum_clean_bitacc_latent = 0.0
+            accum_clean_count = 0
 
         # Sample grid
         if step % sample_interval == 0:

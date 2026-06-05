@@ -15,10 +15,14 @@ import torch.nn as nn
 
 
 class ImageWatermarkDetector(nn.Module):
-    """Lightweight CNN that predicts per-bit probabilities from an image.
+    """Lightweight CNN that predicts watermark bits from an image.
 
     The detector uses adaptive pooling, so the same module works for smoke
     64x64 runs and full 256x256 CUDA runs.
+
+    ``forward`` returns probabilities for backwards-compatible evaluation code.
+    Training code should call ``logits`` and use ``BCEWithLogitsLoss`` so the
+    image watermark loss is safe under torch autocast/bf16.
     """
 
     def __init__(
@@ -56,11 +60,14 @@ class ImageWatermarkDetector(nn.Module):
             nn.Linear(self.hidden_dim, self.bit_length),
         )
 
-    def forward(self, x_w: torch.Tensor) -> torch.Tensor:
-        """Predict bit probabilities from an image batch in ``[-1, 1]``."""
+    def logits(self, x_w: torch.Tensor) -> torch.Tensor:
+        """Predict raw bit logits from an image batch in ``[-1, 1]``."""
         if x_w.dim() != 4:
             raise ValueError(f"x_w must be [B, C, H, W], got {tuple(x_w.shape)}.")
         h = self.features(x_w)
         h = self.pool(h)
-        logits = self.head(h)
-        return torch.sigmoid(logits)
+        return self.head(h)
+
+    def forward(self, x_w: torch.Tensor) -> torch.Tensor:
+        """Predict bit probabilities from an image batch in ``[-1, 1]``."""
+        return torch.sigmoid(self.logits(x_w))

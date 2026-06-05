@@ -14,7 +14,12 @@ import torch.nn as nn
 
 
 class TraceLatentDetector(nn.Module):
-    """Lightweight CNN that predicts per-bit probabilities from protected latents."""
+    """Lightweight CNN that predicts watermark bits from protected latents.
+
+    ``forward`` returns probabilities for evaluation. Training code should call
+    ``logits`` and use ``BCEWithLogitsLoss`` so the latent watermark loss is
+    safe under torch autocast/bf16.
+    """
 
     def __init__(
         self,
@@ -49,11 +54,14 @@ class TraceLatentDetector(nn.Module):
             nn.Linear(self.hidden_dim, self.bit_length),
         )
 
-    def forward(self, z_k: torch.Tensor) -> torch.Tensor:
-        """Predict bit probabilities from a protected latent batch."""
+    def logits(self, z_k: torch.Tensor) -> torch.Tensor:
+        """Predict raw bit logits from a protected latent batch."""
         if z_k.dim() != 4:
             raise ValueError(f"z_k must be [B, C, H, W], got {tuple(z_k.shape)}.")
         h = self.features(z_k)
         h = self.pool(h)
-        logits = self.head(h)
-        return torch.sigmoid(logits)
+        return self.head(h)
+
+    def forward(self, z_k: torch.Tensor) -> torch.Tensor:
+        """Predict bit probabilities from a protected latent batch."""
+        return torch.sigmoid(self.logits(z_k))

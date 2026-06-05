@@ -18,6 +18,14 @@ training:
   batch_size: 24
   grad_accum_steps: 3
 
+entries:
+  train_final:
+    overrides:
+      training:
+        batch_size: 16
+        grad_accum_steps: 4
+        mixed_precision: bf16
+
 data:
   name: cifar10
   root: ./data
@@ -93,20 +101,22 @@ python -B -m scripts.traceflow train-final \
   --detach
 ```
 
-The default `batch_size=24, grad_accum_steps=3` is the balanced 32 GB GPU path.
-If you want to push memory harder after a successful preflight, try:
+The top-level `batch_size=24, grad_accum_steps=3` is used by generator-only
+training. Full TraceFlow uses the safer entry override
+`batch_size=16, grad_accum_steps=4, mixed_precision=bf16` because the watermark
+path adds a decode/re-encode cycle. If you want to push memory harder after a
+successful preflight, create a separate bundle and try:
 
 ```bash
 python -B -m scripts.traceflow train-final \
   --config configs/traceflow.yml \
-  --bundle-dir /root/autodl-tmp/traceflow_runs/final_50k_bs32 \
-  --set training.batch_size=32 \
-  --set training.grad_accum_steps=2 \
+  --bundle-dir /root/autodl-tmp/traceflow_runs/final_50k_bs16 \
+  --set training.batch_size=16 \
+  --set training.grad_accum_steps=4 \
   --detach
 ```
 
-If that run hits CUDA OOM, return to the default `24 x 3` setting in
-`configs/traceflow.yml`.
+If that run hits CUDA OOM, fall back to `batch_size=12, grad_accum_steps=6`.
 
 Advanced/debug commands (`train`, `experiment`, `figures`, `readiness`) remain
 available, but normal server runs should use the three entries above.

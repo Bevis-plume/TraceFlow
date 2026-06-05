@@ -27,7 +27,7 @@ from src.security.keyed_bottleneck import KeyedLatentBottleneck
 from src.watermarking.latent_watermark import TraceLatentDetector
 from src.watermarking.decoder_watermark import TraceDecoderAdapter
 from src.watermarking.image_watermark import ImageWatermarkDetector
-from src.watermarking.message import generate_watermark_bits, expand_bits
+from src.watermarking.message import generate_watermark_bits, expand_bits, generate_random_batch_bits
 from src.watermarking.factory import build_watermark_modules
 from src.watermarking.metrics import bit_accuracy, bit_error_rate
 
@@ -161,6 +161,10 @@ def main() -> None:
     )
 
     # Step 4: image detector
+    logits_img = image_detector.logits(x_w)
+    assert logits_img.shape == (B, bit_length), (
+        f"image detector logits shape: {tuple(logits_img.shape)}"
+    )
     probs_img = image_detector(x_w)
     assert probs_img.shape == (B, bit_length), (
         f"image detector probs shape: {tuple(probs_img.shape)}"
@@ -181,6 +185,10 @@ def main() -> None:
     )
 
     # Step 7: latent detector
+    logits_lat = latent_detector.logits(z_re_k)
+    assert logits_lat.shape == (B, bit_length), (
+        f"latent detector logits shape: {tuple(logits_lat.shape)}"
+    )
     probs_lat = latent_detector(z_re_k)
     assert probs_lat.shape == (B, bit_length), (
         f"latent detector probs shape: {tuple(probs_lat.shape)}"
@@ -199,7 +207,7 @@ def main() -> None:
     latent_detector.train()
     autoencoder.eval()  # frozen AE
 
-    bce = nn.BCELoss()
+    bce = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.Adam(
         list(adapter.parameters())
         + list(image_detector.parameters())
@@ -218,10 +226,10 @@ def main() -> None:
     x_d = autoencoder.decode_with_grad(z_inv)
     res = adapter(x_d, batch_bits)
     x_wm = torch.clamp(x_d + alpha * res, -1.0, 1.0)
-    p_img = image_detector(x_wm)
+    logits_img = image_detector.logits(x_wm)
     z_r = autoencoder.encode_with_grad(x_wm)
     z_r_k = klb(z_r)
-    p_lat = latent_detector(z_r_k)
+    logits_lat = latent_detector.logits(z_r_k)
 
     # TraceFlow combined loss
     lambda_wm_img = cfg["lambda_wm_img"]
@@ -230,8 +238,8 @@ def main() -> None:
     lambda_cycle = cfg["lambda_cycle"]
     lambda_residual = cfg["lambda_residual"]
 
-    loss_img_wm = bce(p_img, batch_bits)
-    loss_lat_wm = bce(p_lat, batch_bits)
+    loss_img_wm = bce(logits_img, batch_bits)
+    loss_lat_wm = bce(logits_lat, batch_bits)
     loss_img = (x_wm - x_d.detach()).pow(2).mean()
     loss_cycle = (z_r_k - z_hat_k_grad.detach()).pow(2).mean()
     loss_res = res.pow(2).mean()
@@ -403,10 +411,12 @@ def main() -> None:
         x_test = autoencoder.decode_with_grad(z_test_inv)
         res_test = adapter(x_test, rand_batch_bits_c)
         x_wm_test = torch.clamp(x_test + alpha * res_test, -1.0, 1.0)
-        p_img_test = image_detector(x_wm_test)
+        logits_img_test = image_detector.logits(x_wm_test)
+        p_img_test = torch.sigmoid(logits_img_test)
         z_re_test = autoencoder.encode_with_grad(x_wm_test)
         z_re_k_test = klb(z_re_test)
-        p_lat_test = latent_detector(z_re_k_test)
+        logits_lat_test = latent_detector.logits(z_re_k_test)
+        p_lat_test = torch.sigmoid(logits_lat_test)
 
     assert p_img_test.shape == (B, bit_length), (
         f"random_per_sample image detector shape {tuple(p_img_test.shape)} != ({B}, {bit_length})"
@@ -415,8 +425,8 @@ def main() -> None:
         f"random_per_sample latent detector shape {tuple(p_lat_test.shape)} != ({B}, {bit_length})"
     )
     # Loss must be computable with per-sample non-identical bits.
-    bce_test = nn.BCELoss()
-    loss_test = bce_test(p_img_test, rand_batch_bits_c) + bce_test(p_lat_test, rand_batch_bits_c)
+    bce_test = nn.BCEWithLogitsLoss()
+    loss_test = bce_test(logits_img_test, rand_batch_bits_c) + bce_test(logits_lat_test, rand_batch_bits_c)
     assert math.isfinite(loss_test.item()), (
         f"loss not finite with random_per_sample bits: {loss_test.item()}"
     )
@@ -424,6 +434,34 @@ def main() -> None:
         f"[test] TraceFlow pipeline with random_per_sample bits: PASS  "
         f"loss={loss_test.item():.4f}"
     )
+
+    # CUDA bf16 regression guard for the production training path. PyTorch
+    # rejects sigmoid+BCELoss under autocast, so TraceFlow must keep training
+    # losses on logits with BCEWithLogitsLoss.
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        img_det_cuda = ImageWatermarkDetector(
+            bit_length=bit_length,
+            image_size=image_size,
+            channels=channels,
+            hidden_dim=hidden_dim,
+        ).to(device)
+        lat_det_cuda = TraceLatentDetector(
+            bit_length=bit_length,
+            latent_channels=latent_channels,
+            hidden_dim=latent_detector_hidden_dim,
+        ).to(device)
+        x_cuda = torch.randn(B, channels, image_size, image_size, device=device)
+        z_cuda = torch.randn(B, latent_channels, latent_size, latent_size, device=device)
+        bits_cuda = generate_random_batch_bits(bit_length, B, device=device)
+        bce_logits = nn.BCEWithLogitsLoss()
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            loss_amp = bce_logits(img_det_cuda.logits(x_cuda), bits_cuda)
+            loss_amp = loss_amp + bce_logits(lat_det_cuda.logits(z_cuda), bits_cuda)
+        assert math.isfinite(loss_amp.item()), f"bf16 logits BCE loss not finite: {loss_amp.item()}"
+        print(f"[test] bf16 autocast logits BCE path: PASS  loss={loss_amp.item():.4f}")
+    else:
+        print("[test] bf16 autocast logits BCE path: SKIP (CUDA unavailable)")
 
     print("[test] ── ALL TRACEFLOW WATERMARK SMOKE CHECKS PASSED ──")
 

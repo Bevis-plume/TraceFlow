@@ -27,8 +27,20 @@ entries:
     run_name: traceflow-cifar50k-generator
   train_final:
     run_name: traceflow-cifar50k-final
+    # Full TraceFlow uses bf16 plus a 5090-oriented micro-batch. If your server
+    # still OOMs, override to batch_size=12 and grad_accum_steps=6.
+    overrides:
+      training:
+        batch_size: 16
+        grad_accum_steps: 4
+        mixed_precision: bf16
   run_all:
     run_name: traceflow-cifar50k-paper-all
+    overrides:
+      training:
+        batch_size: 16
+        grad_accum_steps: 4
+        mixed_precision: bf16
 
 project:
   name: traceflow-cifar-50k
@@ -67,8 +79,8 @@ model:
   num_classes: null
 
 training:
-  # Balanced RTX 5090 default. This uses more memory per optimizer step than
-  # 16x4 while keeping enough headroom for the full TraceFlow VAE/watermark path.
+  # Generator-friendly RTX 5090 default. Full TraceFlow uses entry-level
+  # overrides below because the watermark path adds a decode/re-encode cycle.
   batch_size: 24
   grad_accum_steps: 3
   num_steps: 50000           # change this to 5000 / 20000 / 50000 / 400000 as needed
@@ -77,6 +89,9 @@ training:
   warmup_steps: 5000
   ema_decay: 0.9999
   mixed_precision: bf16      # none | bf16 | fp16
+  fused_optimizer: true      # CUDA AdamW fused path when supported
+  matmul_precision: high     # high gives faster TF32 matmuls for fp32 fallbacks
+  clean_fp_interval: 500     # clean false-positive diagnostics are expensive; 0 disables
   log_interval: 50
   sample_interval: 5000
   save_interval: 10000

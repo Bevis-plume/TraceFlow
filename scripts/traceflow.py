@@ -337,10 +337,16 @@ def _single_experiment_config(raw: Mapping[str, Any], exp_id: str, overrides: Li
     }
 
 
-def _final_entry_config(raw: Mapping[str, Any], *, method: str, run_name: str, overrides: List[str], paths: Mapping[str, Path]) -> Dict[str, Any]:
+def _entry_overrides(raw: Mapping[str, Any], entry: str) -> Dict[str, Any]:
+    entry_cfg = raw.get("entries", {}).get(entry, {})
+    return deepcopy(entry_cfg.get("overrides", {}))
+
+
+def _final_entry_config(raw: Mapping[str, Any], *, method: str, run_name: str, entry: str, overrides: List[str], paths: Mapping[str, Path]) -> Dict[str, Any]:
     resolved = _base_config(raw)
     _apply_method(resolved, method, raw)
     _set_project(resolved, name=run_name)
+    resolved = deep_merge(resolved, _entry_overrides(raw, entry))
     _point_config_at_bundle(resolved, paths)
     resolved = apply_overrides(resolved, overrides)
     _point_config_at_bundle(resolved, paths)
@@ -389,7 +395,7 @@ def _train_final_entry(args: argparse.Namespace, *, entry: str, method: str, fal
     paths = _ensure_bundle(bundle)
     _write_bundle_source(raw, args.config, paths)
     _write_readme(paths, title=f"TraceFlow {entry.replace('_', ' ')} bundle")
-    resolved = _final_entry_config(raw, method=method, run_name=run_name, overrides=args.set_overrides, paths=paths)
+    resolved = _final_entry_config(raw, method=method, run_name=run_name, entry=entry, overrides=args.set_overrides, paths=paths)
     config_path = _write_bundle_config(resolved, paths)
     print(f"[traceflow] entry:  {entry}")
     print(f"[traceflow] bundle: {paths['root']}")
@@ -487,25 +493,25 @@ def _check_data(cfg: Mapping[str, Any], checks: List[Dict[str, Any]]) -> None:
         _preflight_add(checks, "data", "error", f"unknown data.name={name!r}")
 
 
-def _check_training_budget(cfg: Mapping[str, Any], checks: List[Dict[str, Any]]) -> None:
+def _check_training_budget(cfg: Mapping[str, Any], checks: List[Dict[str, Any]], *, name: str = "training.batch") -> None:
     training = cfg.get("training", {})
     try:
         batch_size = int(training.get("batch_size", 0))
         grad_accum = int(training.get("grad_accum_steps", 1))
         num_steps = int(training.get("num_steps", 0))
     except (TypeError, ValueError):
-        _preflight_add(checks, "training.batch", "error", "batch_size, grad_accum_steps, and num_steps must be integers")
+        _preflight_add(checks, name, "error", "batch_size, grad_accum_steps, and num_steps must be integers")
         return
     effective_batch = batch_size * grad_accum
     detail = f"batch_size={batch_size}, grad_accum_steps={grad_accum}, effective_batch={effective_batch}, num_steps={num_steps}"
     if batch_size <= 0 or grad_accum <= 0 or num_steps <= 0:
-        _preflight_add(checks, "training.batch", "error", detail + "; values must be positive")
+        _preflight_add(checks, name, "error", detail + "; values must be positive")
     elif batch_size > 32:
-        _preflight_add(checks, "training.batch", "warn", detail + "; micro-batch >32 may OOM on full TraceFlow")
-    elif batch_size < 16 and str(cfg.get("project", {}).get("device", "auto")) == "cuda":
-        _preflight_add(checks, "training.batch", "warn", detail + "; safe but likely underuses a 32 GB GPU")
+        _preflight_add(checks, name, "warn", detail + "; micro-batch >32 may OOM on full TraceFlow")
+    elif batch_size < 8 and str(cfg.get("project", {}).get("device", "auto")) == "cuda":
+        _preflight_add(checks, name, "warn", detail + "; safe but likely underuses a 32 GB GPU")
     else:
-        _preflight_add(checks, "training.batch", "ok", detail)
+        _preflight_add(checks, name, "ok", detail)
 
 
 def _write_preflight_report(paths: Mapping[str, Path], checks: List[Dict[str, Any]], *, strict: bool) -> None:
@@ -557,16 +563,18 @@ def _check_ready(args: argparse.Namespace) -> int:
             _preflight_add(checks, "device", "ok", f"configured device={device}")
 
     try:
-        resolved_final = _final_entry_config(raw, method="traceflow", run_name=_entry_run_name(raw, "train_final", "traceflow-final"), overrides=args.set_overrides, paths=paths)
+        resolved_final = _final_entry_config(raw, method="traceflow", run_name=_entry_run_name(raw, "train_final", "traceflow-final"), entry="train_final", overrides=args.set_overrides, paths=paths)
         _write_bundle_config(resolved_final, paths, name="preflight_final")
         _preflight_add(checks, "config.train_final", "ok", "resolved full TraceFlow config validates")
+        _check_training_budget(resolved_final, checks, name="training.train_final")
     except Exception as exc:
         resolved_final = _base_config(raw)
         _preflight_add(checks, "config.train_final", "error", str(exc))
     try:
-        resolved_gen = _final_entry_config(raw, method="baseline", run_name=_entry_run_name(raw, "train_generator", "traceflow-generator"), overrides=args.set_overrides, paths=paths)
+        resolved_gen = _final_entry_config(raw, method="baseline", run_name=_entry_run_name(raw, "train_generator", "traceflow-generator"), entry="train_generator", overrides=args.set_overrides, paths=paths)
         _write_bundle_config(resolved_gen, paths, name="preflight_generator")
         _preflight_add(checks, "config.train_generator", "ok", "resolved generator-only config validates")
+        _check_training_budget(resolved_gen, checks, name="training.train_generator")
     except Exception as exc:
         _preflight_add(checks, "config.train_generator", "error", str(exc))
     for exp_id in EXP_ORDER:
@@ -578,7 +586,7 @@ def _check_ready(args: argparse.Namespace) -> int:
         except Exception as exc:
             _preflight_add(checks, f"config.{exp_id}", "error", str(exc))
 
-    _check_training_budget(effective_raw, checks)
+    _check_training_budget(effective_raw, checks, name="training.top_level")
     _check_data(effective_raw, checks)
 
     ae = effective_raw.get("autoencoder", {})
@@ -650,6 +658,8 @@ def _run_all(args: argparse.Namespace) -> int:
             resolved, exp_meta = compose_suite_experiment(raw, exp_id, repo_root=Path.cwd(), set_overrides=args.set_overrides)
         if exp_meta.get("enabled") is False:
             continue
+        resolved = deep_merge(resolved, _entry_overrides(raw, "run_all"))
+        resolved = apply_overrides(resolved, args.set_overrides)
         _point_config_at_bundle(resolved, paths)
         validate_resolved_config(resolved)
         config_path = _write_bundle_config(resolved, {**paths, "configs": exp_config_dir}, name=exp_id)

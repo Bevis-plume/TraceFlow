@@ -151,17 +151,17 @@ def _traceflow_loss_from_latent(
     residual = decoder_adapter(x_hat, batch_bits)
     x_w = torch.clamp(x_hat + alpha * residual, -1.0, 1.0)
 
-    bce = nn.BCELoss()
-    bit_probs = extractor(x_w)
-    wm_img_l = bce(bit_probs, batch_bits)
+    bce = nn.BCEWithLogitsLoss()
+    bit_logits = extractor.logits(x_w)
+    wm_img_l = bce(bit_logits, batch_bits)
     img_l = F.mse_loss(x_w, x_hat.detach())
     residual_l = residual.pow(2).mean()
 
     # --- Latent cycle path (re-encode → latent detector) ---
     z_re = autoencoder.encode_with_grad(x_w)
     z_re_k = latent_transform(z_re)                    # identity for no_key attacker
-    bit_probs_latent = latent_detector(z_re_k)
-    wm_latent_l = bce(bit_probs_latent, batch_bits)
+    bit_logits_latent = latent_detector.logits(z_re_k)
+    wm_latent_l = bce(bit_logits_latent, batch_bits)
     cycle_l = F.mse_loss(z_re_k, z_hat_k.detach())
 
     loss = (
