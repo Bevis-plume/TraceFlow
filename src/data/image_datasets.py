@@ -136,8 +136,15 @@ def build_dataloader(
     pin_memory: bool = False,
     shuffle: bool = True,
     drop_last: bool = True,
+    persistent_workers: bool = False,
+    prefetch_factor: Optional[int] = None,
 ) -> DataLoader:
     """Build a DataLoader for a given dataset."""
+    kwargs = {}
+    if num_workers > 0:
+        kwargs["persistent_workers"] = persistent_workers
+        if prefetch_factor is not None:
+            kwargs["prefetch_factor"] = prefetch_factor
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -145,6 +152,7 @@ def build_dataloader(
         num_workers=num_workers,
         pin_memory=pin_memory,
         drop_last=drop_last,
+        **kwargs,
     )
 
 

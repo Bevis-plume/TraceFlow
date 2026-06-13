@@ -434,6 +434,8 @@ def fig_curves(experiments: Dict[str, Dict[str, Any]], out_stem: Path) -> None:
         ("loss_flow", "flow", "loss_flow"),
         ("loss_wm_img", "wm image", "image_detector"),
         ("loss_wm_latent", "wm latent", "latent_detector"),
+        ("loss_wm_robust", "wm robust", "image_bit_acc"),
+        ("loss_clean_negative", "clean negative", "clean_false_positive"),
         ("loss_img", "image recon", "gml"),
         ("loss_cycle", "cycle", "clean_false_positive"),
         ("loss_residual", "residual", "loss"),

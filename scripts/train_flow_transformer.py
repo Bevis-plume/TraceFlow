@@ -24,6 +24,7 @@ from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision.utils as vutils
 from torchvision.transforms.functional import to_pil_image
 import yaml
@@ -66,6 +67,128 @@ def _build_scaler(mixed_precision: str, device: torch.device):
     if mixed_precision == "fp16" and device.type == "cuda":
         return torch.cuda.amp.GradScaler()
     return None
+
+
+def _ramp(step: int, start: int, length: int) -> float:
+    if length <= 0:
+        return 1.0 if step + 1 >= start else 0.0
+    return min(1.0, max(0.0, float(step + 1 - start) / float(length)))
+
+
+def _watermark_phase_weights(wm_cfg: Dict[str, Any], step: int) -> Dict[str, float]:
+    """Staged TraceFlow loss schedule.
+
+    0-main: ramp core watermark losses without hurting flow learning.
+    robust: ramp augmentation losses after the core signal appears.
+    polish: ramp clean-negative/perceptual/frequency terms late in training.
+    """
+    main_steps = int(wm_cfg.get("schedule_main_steps", wm_cfg.get("schedule_warmup_steps", 0)) or 0)
+    robust_start = int(wm_cfg.get("schedule_robust_start", main_steps) or 0)
+    robust_steps = int(wm_cfg.get("schedule_robust_steps", 30000) or 0)
+    polish_start = int(wm_cfg.get("schedule_polish_start", 30000) or 0)
+    polish_steps = int(wm_cfg.get("schedule_polish_steps", 5000) or 0)
+    main = _ramp(step, 0, main_steps) if main_steps > 0 else 1.0
+    robust = _ramp(step, robust_start, robust_steps)
+    polish = _ramp(step, polish_start, polish_steps)
+    return {"main": main, "robust": robust, "polish": polish}
+
+
+def _carrier_schedule_scale(wm_cfg: Dict[str, Any], step: int) -> float:
+    """Slowly enable direct image-domain carriers.
+
+    The carrier path is useful as a stable spread-spectrum scaffold, but if it
+    is fully enabled immediately it can solve the image detector task much
+    faster than the re-encoded latent detector.  Ramping it keeps the paper's
+    core re-encoder/latent trace objective in the driver's seat.
+    """
+    if not bool(wm_cfg.get("carrier_schedule_enabled", False)):
+        return 1.0
+    start = int(wm_cfg.get("carrier_schedule_start", 0) or 0)
+    steps = int(wm_cfg.get("carrier_schedule_steps", 1) or 1)
+    min_scale = float(wm_cfg.get("carrier_schedule_min_scale", 0.0))
+    if step + 1 < start:
+        return min_scale
+    progress = min(1.0, max(0.0, float(step + 1 - start) / float(max(steps, 1))))
+    return min_scale + (1.0 - min_scale) * progress
+
+
+def _clean_negative_loss(logits: torch.Tensor) -> torch.Tensor:
+    """Penalize confident bit predictions on clean, unwatermarked samples."""
+    return F.binary_cross_entropy_with_logits(logits, torch.full_like(logits, 0.5))
+
+def _high_frequency(x: torch.Tensor) -> torch.Tensor:
+    return x - F.avg_pool2d(x, kernel_size=5, stride=1, padding=2)
+
+
+def _frequency_loss(residual: torch.Tensor) -> torch.Tensor:
+    """Encourage residual energy to live in high-frequency texture."""
+    high = _high_frequency(residual)
+    low = residual - high
+    return low.pow(2).mean() / (high.pow(2).mean().detach() + 1e-6)
+
+
+def _perceptual_invisibility_loss(x_w: torch.Tensor, x_ref: torch.Tensor) -> torch.Tensor:
+    """Lightweight perceptual proxy used during training.
+
+    LPIPS is intentionally reserved for evaluation because running it every
+    training step is expensive.  This proxy combines low-resolution structure
+    and high-frequency differences, which is stable under bf16 training.
+    """
+    x_ref = x_ref.detach()
+    scales = [1.0, 0.5, 0.25]
+    losses = []
+    for scale in scales:
+        if scale < 1.0:
+            size = (max(8, int(x_w.shape[-2] * scale)), max(8, int(x_w.shape[-1] * scale)))
+            a = F.interpolate(x_w, size=size, mode="bilinear", align_corners=False)
+            b = F.interpolate(x_ref, size=size, mode="bilinear", align_corners=False)
+        else:
+            a, b = x_w, x_ref
+        losses.append(F.l1_loss(a, b))
+    losses.append(F.l1_loss(_high_frequency(x_w), _high_frequency(x_ref)))
+    return torch.stack(losses).mean()
+
+
+def _chunked_bce_logits_loss(
+    module: nn.Module,
+    x: torch.Tensor,
+    bits: torch.Tensor,
+    loss_fn: nn.Module,
+    chunk_size: int,
+) -> torch.Tensor:
+    """Compute BCE(logits(x), bits) in chunks to cap activation memory."""
+    batch = x.size(0)
+    chunk_size = max(1, int(chunk_size or batch))
+    if chunk_size >= batch:
+        return loss_fn(module.logits(x), bits)
+    losses = []
+    weights = []
+    for start in range(0, batch, chunk_size):
+        end = min(start + chunk_size, batch)
+        losses.append(loss_fn(module.logits(x[start:end]), bits[start:end]))
+        weights.append(end - start)
+    total = sum(loss * weight for loss, weight in zip(losses, weights))
+    return total / float(sum(weights))
+
+
+def _chunked_clean_negative_loss(
+    module: nn.Module,
+    x: torch.Tensor,
+    chunk_size: int,
+) -> torch.Tensor:
+    """Compute clean-negative loss in chunks to cap detector activations."""
+    batch = x.size(0)
+    chunk_size = max(1, int(chunk_size or batch))
+    if chunk_size >= batch:
+        return _clean_negative_loss(module.logits(x))
+    losses = []
+    weights = []
+    for start in range(0, batch, chunk_size):
+        end = min(start + chunk_size, batch)
+        losses.append(_clean_negative_loss(module.logits(x[start:end])))
+        weights.append(end - start)
+    total = sum(loss * weight for loss, weight in zip(losses, weights))
+    return total / float(sum(weights))
 
 
 def _save_image_grid(
@@ -186,7 +309,14 @@ def train(args: argparse.Namespace) -> None:
     print(f"[train] Device: {device}")
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
         torch.set_float32_matmul_precision(cfg["training"].get("matmul_precision", "high"))
+        print(
+            "[train] CUDA performance: cudnn.benchmark=True "
+            f"matmul_precision={cfg['training'].get('matmul_precision', 'high')} "
+            "tf32=True"
+        )
 
     # Determine run name and isolated per-run directories.
     # An explicit --run-name always wins.  In smoke mode the default is "smoke"
@@ -238,6 +368,8 @@ def train(args: argparse.Namespace) -> None:
         num_workers=0 if smoke else cfg["data"].get("num_workers", 4),
         pin_memory=False if smoke else cfg["data"].get("pin_memory", False),
         drop_last=True,
+        persistent_workers=False if smoke else cfg["data"].get("persistent_workers", False),
+        prefetch_factor=None if smoke else cfg["data"].get("prefetch_factor"),
     )
     print(f"[train] Dataset: {cfg['data']['name']} | {len(dataset)} samples | "
           f"batch_size={cfg['training']['batch_size']}")
@@ -307,6 +439,10 @@ def train(args: argparse.Namespace) -> None:
         num_classes=m_cfg.get("num_classes"),
     ).to(device)
 
+    if cfg["training"].get("torch_compile", False) and device.type == "cuda":
+        print("[train] torch.compile: enabled")
+        model = torch.compile(model)
+
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[train] FlowTransformer params: {num_params / 1e6:.2f}M")
 
@@ -342,7 +478,7 @@ def train(args: argparse.Namespace) -> None:
         print("[train] Watermark: disabled")
 
     # EMA
-    from src.utils.checkpoint import EMAModel, save_checkpoint, load_checkpoint
+    from src.utils.checkpoint import EMAModel, save_checkpoint
     ema = EMAModel(model, decay=cfg["training"].get("ema_decay", 0.9999))
 
     # ------------------------------------------------------------------
@@ -374,8 +510,63 @@ def train(args: argparse.Namespace) -> None:
     # ------------------------------------------------------------------
     start_step = 0
     if args.resume:
-        start_step = load_checkpoint(args.resume, model, optimizer, ema_model=ema, device=device)
-        print(f"[train] Resumed from {args.resume} at step {start_step} (EMA restored)")
+        state = torch.load(args.resume, map_location=device, weights_only=True)
+        model.load_state_dict(state["model"])
+
+        if watermark is not None:
+            wm_state = state.get("watermark")
+            if not wm_state:
+                raise RuntimeError(
+                    "Resume checkpoint does not contain TraceFlow watermark module states. "
+                    "Refusing to continue because this would randomly reinitialize the "
+                    "decoder adapter / image detector / latent detector."
+                )
+            missing, unexpected = extractor.load_state_dict(wm_state["extractor"], strict=False)
+            allowed_missing = [
+                k for k in missing
+                if k.startswith("carrier_norm.") or k.startswith("carrier_head.")
+            ]
+            disallowed_missing = [k for k in missing if k not in allowed_missing]
+            if disallowed_missing or unexpected:
+                raise RuntimeError(
+                    "Watermark image detector checkpoint mismatch: "
+                    f"missing={disallowed_missing}, unexpected={unexpected}"
+                )
+            if allowed_missing:
+                print(
+                    "[train] Initialized new image detector carrier parameters "
+                    f"not present in checkpoint: {allowed_missing}"
+                )
+            missing, unexpected = decoder_adapter.load_state_dict(wm_state["decoder_adapter"], strict=False)
+            allowed_missing = [k for k in missing if k.startswith("carrier.")]
+            disallowed_missing = [k for k in missing if not k.startswith("carrier.")]
+            if disallowed_missing or unexpected:
+                raise RuntimeError(
+                    "Watermark decoder adapter checkpoint mismatch: "
+                    f"missing={disallowed_missing}, unexpected={unexpected}"
+                )
+            if allowed_missing:
+                print(
+                    "[train] Initialized new decoder adapter carrier parameters "
+                    f"not present in checkpoint: {allowed_missing}"
+                )
+            missing, unexpected = latent_detector.load_state_dict(wm_state["latent_detector"], strict=False)
+            if missing or unexpected:
+                raise RuntimeError(
+                    "Watermark latent detector checkpoint mismatch: "
+                    f"missing={missing}, unexpected={unexpected}"
+                )
+            print("[train] Restored TraceFlow watermark modules from checkpoint")
+
+        if optimizer is not None and "optimizer" in state:
+            try:
+                optimizer.load_state_dict(state["optimizer"])
+            except ValueError as exc:
+                print(f"[train] Warning: optimizer state was not restored: {exc}")
+        if "ema_model" in state:
+            ema.load_state_dict(state["ema_model"])
+        start_step = int(state.get("step", 0))
+        print(f"[train] Resumed from {args.resume} at step {start_step} (model/EMA/watermark restored)")
 
     # ------------------------------------------------------------------
     # 9. Training loop
@@ -409,6 +600,14 @@ def train(args: argparse.Namespace) -> None:
     accum_ber = 0.0
     # traceflow-specific accumulators
     accum_wm_latent = 0.0
+    accum_wm_robust = 0.0
+    accum_clean_negative = 0.0
+    accum_perceptual = 0.0
+    accum_frequency = 0.0
+    accum_schedule_main = 0.0
+    accum_schedule_robust = 0.0
+    accum_schedule_polish = 0.0
+    accum_carrier_scale = 0.0
     accum_cycle = 0.0
     accum_bitacc_latent = 0.0
     accum_ber_latent = 0.0
@@ -437,6 +636,9 @@ def train(args: argparse.Namespace) -> None:
 
             x, _labels = batch
             x = x.to(device, non_blocking=True)
+            y = None
+            if m_cfg.get("class_conditional", False):
+                y = _labels.to(device, non_blocking=True).long()
 
             with _get_autocast_ctx(mixed_precision, device):
                 with torch.no_grad():
@@ -447,6 +649,10 @@ def train(args: argparse.Namespace) -> None:
                 img_l = None
                 residual_l = None
                 wm_latent_l = None
+                wm_robust_l = None
+                clean_negative_l = None
+                perceptual_l = None
+                frequency_l = None
                 cycle_l = None
                 bit_probs = None
                 bit_probs_latent = None
@@ -454,7 +660,7 @@ def train(args: argparse.Namespace) -> None:
                 clean_bitacc_lat_step = None
 
                 if watermark is not None:
-                    flow_state = flow_loss_with_state(model, z_k)
+                    flow_state = flow_loss_with_state(model, z_k, y=y)
                     flow_l = flow_state["loss"]
                     z_hat_k = flow_state["z_hat"]
 
@@ -482,32 +688,114 @@ def train(args: argparse.Namespace) -> None:
                             _clean_lat_probs = latent_detector(_z_clean_k)
                             clean_bitacc_lat_step = bit_accuracy(_clean_lat_probs, _owner_bits_b)
 
-                    residual = decoder_adapter(x_hat, bits)
-                    x_w = torch.clamp(x_hat + wm_cfg["alpha"] * residual, -1.0, 1.0)
+                    # During the image-watermark bootstrap phase, keep the
+                    # stochastic per-sample bit objective from pushing the flow
+                    # backbone through the VAE decoder.  The adapter/detector
+                    # still receive full gradients and learn a readable image
+                    # carrier; after this phase the complete TraceFlow loss is
+                    # restored end-to-end.
+                    x_hat_for_wm = x_hat.detach() if step < int(wm_cfg.get("image_warmup_detach_until", 0)) else x_hat
+                    carrier_scale = _carrier_schedule_scale(wm_cfg, step)
+                    if hasattr(decoder_adapter, "carrier_strength"):
+                        decoder_adapter.carrier_strength = float(wm_cfg.get("adapter_carrier_strength", 1.0)) * carrier_scale
+                    if hasattr(extractor, "carrier_weight"):
+                        extractor.carrier_weight = float(wm_cfg.get("detector_carrier_weight", 1.0)) * carrier_scale
+                    residual = decoder_adapter(x_hat_for_wm, bits)
+                    x_w = torch.clamp(x_hat_for_wm + wm_cfg["alpha"] * residual, -1.0, 1.0)
                     residual_l = residual.pow(2).mean()
 
                     bit_logits = extractor.logits(x_w)
                     wm_l = bce_loss(bit_logits, bits)
                     bit_probs = torch.sigmoid(bit_logits)
-                    img_l = nn.functional.mse_loss(x_w, x_hat.detach())
+                    img_l = F.mse_loss(x_w, x_hat.detach())
 
                     z_re = autoencoder.encode_with_grad(x_w)
                     z_re_k = latent_transform(z_re)
                     bit_logits_latent = latent_detector.logits(z_re_k)
                     wm_latent_l = bce_loss(bit_logits_latent, bits)
                     bit_probs_latent = torch.sigmoid(bit_logits_latent)
-                    cycle_l = nn.functional.mse_loss(z_re_k, z_hat_k.detach())
+                    cycle_l = F.mse_loss(z_re_k, z_hat_k.detach())
+
+                    phase = _watermark_phase_weights(wm_cfg, step)
+
+                    wm_robust_l = torch.zeros((), device=device, dtype=flow_l.dtype)
+                    robust_weight_active = (
+                        phase["robust"] > 0.0
+                        and wm_cfg.get("robustness_enabled", False)
+                        and wm_cfg.get("lambda_wm_robust", 0.0) > 0
+                    )
+                    if robust_weight_active:
+                        from src.watermarking.augment import deterministic_robust_views
+                        robust_losses = []
+                        max_views = int(wm_cfg.get("robust_max_views", 2))
+                        robust_batch_size = int(wm_cfg.get("robust_batch_size", 0) or x_w.size(0))
+                        robust_batch_size = max(1, min(robust_batch_size, x_w.size(0)))
+                        robust_chunk_size = int(wm_cfg.get("robust_chunk_size", 0) or robust_batch_size)
+                        robust_input = x_w[:robust_batch_size]
+                        robust_bits = bits[:robust_batch_size]
+                        if bool(wm_cfg.get("robust_detach_input", True)):
+                            robust_input = robust_input.detach()
+                        robust_latent_enabled = bool(wm_cfg.get("robust_latent_enabled", False))
+                        for x_view in deterministic_robust_views(robust_input)[1:1 + max(0, max_views)]:
+                            robust_losses.append(
+                                _chunked_bce_logits_loss(
+                                    extractor,
+                                    x_view,
+                                    robust_bits,
+                                    bce_loss,
+                                    robust_chunk_size,
+                                )
+                            )
+                            if robust_latent_enabled:
+                                z_view = autoencoder.encode_with_grad(x_view)
+                                z_view_k = latent_transform(z_view)
+                                robust_losses.append(bce_loss(latent_detector.logits(z_view_k), robust_bits))
+                        if robust_losses:
+                            wm_robust_l = torch.stack(robust_losses).mean()
+
+                    clean_negative_l = torch.zeros((), device=device, dtype=flow_l.dtype)
+                    if phase["polish"] > 0.0 and wm_cfg.get("lambda_clean_negative", 0.0) > 0:
+                        clean_negative_batch_size = int(wm_cfg.get("clean_negative_batch_size", 0) or x_hat.size(0))
+                        clean_negative_batch_size = max(1, min(clean_negative_batch_size, x_hat.size(0)))
+                        clean_negative_chunk_size = int(
+                            wm_cfg.get("clean_negative_chunk_size", 0) or clean_negative_batch_size
+                        )
+                        clean_x = x_hat[:clean_negative_batch_size].detach()
+                        clean_img_negative_l = _chunked_clean_negative_loss(
+                            extractor,
+                            clean_x,
+                            clean_negative_chunk_size,
+                        )
+                        with torch.no_grad():
+                            clean_z_k = latent_transform(autoencoder.encode(clean_x))
+                        clean_lat_logits = latent_detector.logits(clean_z_k.detach())
+                        clean_negative_l = 0.5 * (
+                            clean_img_negative_l
+                            + _clean_negative_loss(clean_lat_logits)
+                        )
+
+                    perceptual_l = torch.zeros((), device=device, dtype=flow_l.dtype)
+                    if phase["polish"] > 0.0 and wm_cfg.get("lambda_perceptual", 0.0) > 0:
+                        perceptual_l = _perceptual_invisibility_loss(x_w, x_hat)
+
+                    frequency_l = torch.zeros((), device=device, dtype=flow_l.dtype)
+                    if phase["polish"] > 0.0 and wm_cfg.get("lambda_frequency", 0.0) > 0:
+                        frequency_l = _frequency_loss(residual)
 
                     sub_loss = (
                         flow_l
-                        + wm_cfg["lambda_wm_img"] * wm_l
-                        + wm_cfg["lambda_wm_latent"] * wm_latent_l
+                        + phase["main"] * wm_cfg["lambda_wm_img"] * wm_l
+                        + phase["main"] * wm_cfg["lambda_wm_latent"] * wm_latent_l
+                        + phase["robust"] * wm_cfg.get("lambda_wm_robust", 0.0) * wm_robust_l
+                        + phase["polish"] * wm_cfg.get("lambda_clean_negative", 0.0) * clean_negative_l
                         + wm_cfg["lambda_img"] * img_l
                         + wm_cfg["lambda_cycle"] * cycle_l
                         + wm_cfg["lambda_residual"] * residual_l
+                        + phase["polish"] * wm_cfg.get("lambda_perceptual", 0.0) * perceptual_l
+                        + phase["polish"] * wm_cfg.get("lambda_frequency", 0.0) * frequency_l
                     )
                 else:
-                    flow_l = flow_loss(model, z_k)
+                    flow_l = flow_loss(model, z_k, y=y)
                     sub_loss = flow_l
 
                 sub_loss = sub_loss / grad_accum  # scale for correct gradient sum
@@ -525,6 +813,14 @@ def train(args: argparse.Namespace) -> None:
                 accum_wm += wm_l.item()
                 accum_img += img_l.item()
                 accum_residual += residual_l.item()
+                accum_wm_robust += wm_robust_l.item()
+                accum_clean_negative += clean_negative_l.item()
+                accum_perceptual += perceptual_l.item()
+                accum_frequency += frequency_l.item()
+                accum_schedule_main += phase["main"]
+                accum_schedule_robust += phase["robust"]
+                accum_schedule_polish += phase["polish"]
+                accum_carrier_scale += carrier_scale
                 with torch.no_grad():
                     accum_bitacc += bit_accuracy(bit_probs, bits)
                     accum_ber += bit_error_rate(bit_probs, bits)
@@ -571,6 +867,15 @@ def train(args: argparse.Namespace) -> None:
             if watermark is not None:
                 record["loss_wm_img"] = accum_wm / n_sub
                 record["loss_wm_latent"] = accum_wm_latent / n_sub
+                record["loss_wm_robust"] = accum_wm_robust / n_sub
+                record["loss_clean_negative"] = accum_clean_negative / n_sub
+                record["loss_perceptual"] = accum_perceptual / n_sub
+                record["loss_frequency"] = accum_frequency / n_sub
+                record["wm_schedule_main"] = accum_schedule_main / n_sub
+                record["wm_schedule_robust"] = accum_schedule_robust / n_sub
+                record["wm_schedule_polish"] = accum_schedule_polish / n_sub
+                record["wm_schedule"] = record["wm_schedule_main"]
+                record["wm_carrier_scale"] = accum_carrier_scale / n_sub
                 record["loss_img"] = accum_img / n_sub
                 record["loss_cycle"] = accum_cycle / n_sub
                 record["loss_residual"] = accum_residual / n_sub
@@ -587,6 +892,9 @@ def train(args: argparse.Namespace) -> None:
                     f"[train] step={step:6d}  loss={avg_loss:.4f}  "
                     f"flow={record['loss_flow']:.4f}  "
                     f"wm_img={record['loss_wm_img']:.4f}  wm_lat={record['loss_wm_latent']:.4f}  "
+                    f"carrier={record['wm_carrier_scale']:.3f}  "
+                    f"wm_rob={record['loss_wm_robust']:.4f}  clean_neg={record['loss_clean_negative']:.4f}  "
+                    f"perc={record['loss_perceptual']:.4f}  freq={record['loss_frequency']:.4f}  "
                     f"img={record['loss_img']:.4f}  cycle={record['loss_cycle']:.4f}  "
                     f"res={record['loss_residual']:.4f}  "
                     f"acc_img={record['bit_acc_img']:.3f}  acc_lat={record['bit_acc_latent']:.3f}  "
@@ -605,6 +913,14 @@ def train(args: argparse.Namespace) -> None:
             accum_bitacc = 0.0
             accum_ber = 0.0
             accum_wm_latent = 0.0
+            accum_wm_robust = 0.0
+            accum_clean_negative = 0.0
+            accum_perceptual = 0.0
+            accum_frequency = 0.0
+            accum_schedule_main = 0.0
+            accum_schedule_robust = 0.0
+            accum_schedule_polish = 0.0
+            accum_carrier_scale = 0.0
             accum_cycle = 0.0
             accum_bitacc_latent = 0.0
             accum_ber_latent = 0.0
@@ -623,7 +939,11 @@ def train(args: argparse.Namespace) -> None:
                     ae_cfg["latent_size"],
                     ae_cfg["latent_size"],
                 )
-                z0_k, z_traj_k = sample_euler_trajectory(model, latent_shape, cfg["sampling"]["steps"], device)
+                y_sample = None
+                if m_cfg.get("class_conditional", False):
+                    num_classes = int(m_cfg.get("num_classes") or 1000)
+                    y_sample = torch.randint(num_classes, (latent_shape[0],), device=device)
+                z0_k, z_traj_k = sample_euler_trajectory(model, latent_shape, cfg["sampling"]["steps"], device, y=y_sample)
                 # Invert key transform before decoding so samples look meaningful.
                 z0 = latent_transform.invert(z0_k)
                 images = autoencoder.decode(z0)
@@ -759,7 +1079,11 @@ def train(args: argparse.Namespace) -> None:
                 ae_cfg["latent_size"],
                 ae_cfg["latent_size"],
             )
-            z0_k = sample_euler(model, latent_shape, cfg["sampling"]["steps"], device)
+            y_sample = None
+            if m_cfg.get("class_conditional", False):
+                num_classes = int(m_cfg.get("num_classes") or 1000)
+                y_sample = torch.randint(num_classes, (latent_shape[0],), device=device)
+            z0_k = sample_euler(model, latent_shape, cfg["sampling"]["steps"], device, y=y_sample)
             z0 = latent_transform.invert(z0_k)
             x_dec = autoencoder.decode(z0)
             eval_bits = expand_bits(wm_bits, x_dec.size(0)).to(device)

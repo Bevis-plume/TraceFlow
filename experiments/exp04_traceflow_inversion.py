@@ -41,17 +41,21 @@ from typing import Any, Dict
 
 from experiments.common import (
     append_csv_row,
-    checkpoint_path,
+    checkpoint_exists,
     copy_config,
+    infer_run_dir_from_checkpoint,
     load_json,
     make_exp_dir,
     print_validation_report,
     read_last_jsonl,
+    resolve_checkpoint,
     run_command,
     select_default_config,
+    should_train_for_policy,
     train_output_dir,
     validate_experiment_config,
     write_json,
+    write_skipped_metrics,
 )
 
 EXP_ID = "exp04"
@@ -93,8 +97,29 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     if dry_run:
         print_validation_report(EXP_ID, validation)
 
+    ckpt = resolve_checkpoint(
+        run_name=run_name,
+        config_path=cfg_path,
+        explicit=getattr(args, "checkpoint", None) or getattr(args, "checkpoint_override", None),
+    )
+    train_policy = getattr(args, "train_policy", "always")
+    train_out = infer_run_dir_from_checkpoint(ckpt, run_name=run_name, config_path=cfg_path)
+
+    if train_policy == "never" and not checkpoint_exists(ckpt, dry_run=dry_run):
+        return write_skipped_metrics(
+            exp_id=EXP_ID,
+            exp_dir=exp_dir,
+            output_base=output_base,
+            config_path=cfg_path,
+            run_name=run_name,
+            smoke=smoke,
+            checkpoint=ckpt,
+            reason="eval-only run has no TraceFlow checkpoint",
+            validation_warnings=validation["warnings"],
+        )
+
     # ------------------------------------------------------------------ #
-    # 1. Train full TraceFlow                                           #
+    # 1. Train full TraceFlow or reuse checkpoint                         #
     # ------------------------------------------------------------------ #
     train_cmd = [
         sys.executable, "-m", "scripts.train_flow_transformer",
@@ -106,13 +131,15 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     if smoke:
         train_cmd.append("--smoke")
 
-    print(f"\n[{EXP_ID}] Step 1/2: train full TraceFlow")
-    result = run_command(train_cmd, dry_run=dry_run)
-    if not dry_run and result["returncode"] != 0:
-        return {"status": "error", "step": "train", "exp_id": EXP_ID}
-
-    ckpt = checkpoint_path(run_name, config_path=cfg_path)
-    train_out = train_output_dir(run_name, config_path=cfg_path)
+    if should_train_for_policy(train_policy, ckpt, dry_run=dry_run):
+        print(f"\n[{EXP_ID}] Step 1/2: train full TraceFlow")
+        result = run_command(train_cmd, dry_run=dry_run)
+        if not dry_run and result["returncode"] != 0:
+            return {"status": "error", "step": "train", "exp_id": EXP_ID}
+        ckpt = resolve_checkpoint(run_name=run_name, config_path=cfg_path)
+        train_out = train_output_dir(run_name, config_path=cfg_path)
+    else:
+        print(f"\n[{EXP_ID}] Step 1/2: reuse checkpoint -> {ckpt}")
 
     # ------------------------------------------------------------------ #
     # 2. Inversion evaluation                                              #
@@ -191,6 +218,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         "pixel_raw_image_bit_acc": pixel_att.get("raw_pixel_image_bit_acc"),
         # Paths:
         "checkpoint": str(ckpt),
+        "output_dir": str(train_out),
         "inversion_output_dir": str(inversion_out),
         "validation_warnings": validation["warnings"],
     }

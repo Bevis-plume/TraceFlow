@@ -1,57 +1,135 @@
 # CUDA Experiment Runbook
 
-Use one config file:
+TraceFlow uses one active config file:
 
 ```text
 configs/traceflow.yml
 ```
 
+The formal paper path is Imagenette-320/ImageFolder data cropped to 256x256 for fast paper pilots on the server data disk. CIFAR is only a legacy/debug option and is not part of the final CUDA runbook.
+
 ## Environment
 
 ```bash
-conda create -n traceflow-cuda python=3.11 -y
+cd /root/autodl-tmp/TraceFlow
 conda activate traceflow-cuda
-pip install -r requirements.txt
-python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
-python -c "from diffusers import AutoencoderKL; print('diffusers ok')"
+
+export OMP_NUM_THREADS=8
+export MKL_NUM_THREADS=8
+export PYTHONUNBUFFERED=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+python - <<'PY'
+import torch
+print("torch:", torch.__version__)
+print("cuda:", torch.version.cuda)
+print("available:", torch.cuda.is_available())
+print("device:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else None)
+PY
 ```
 
-## Data
+## VAE
 
-For final ImageFolder runs, edit `configs/traceflow.yml`:
+The upload bundle should include the local VAE:
 
-```yaml
-data:
-  name: imagefolder
-  root: /root/autodl-tmp/traceflow_data/images_256
-  image_size: 256
+```text
+pretrained/sd-vae-ft-mse/
 ```
 
-For CIFAR pipeline validation, keep:
-
-```yaml
-data:
-  name: cifar10
-  root: ./data
-```
-
-## Run
+Check it on the server:
 
 ```bash
-python -B -m scripts.traceflow experiment
+python - <<'PY'
+from diffusers import AutoencoderKL
+vae = AutoencoderKL.from_pretrained("pretrained/sd-vae-ft-mse")
+print("local VAE loaded")
+PY
 ```
 
-Or override without editing:
+## Assets
+
+Before packaging locally, run:
 
 ```bash
-python -B -m scripts.traceflow experiment   --set data.root=/root/autodl-tmp/traceflow_data/images_256   --set training.num_steps=50000
+python -B -m scripts.traceflow prepare-assets --config configs/traceflow.yml
 ```
 
-## Figures And Readiness
+The upload bundle should include:
+
+```text
+data/imagenette2-320/train/
+data/imagewoof2-320/train/
+data/imagenette_woof_320/train/
+weights/
+pretrained/sd-vae-ft-mse/
+```
+
+On the server, check class and image counts from the project-local data folder:
 
 ```bash
-python -B -m scripts.traceflow figures --results-dir results/traceflow_cifar_50k
-python -B -m scripts.traceflow readiness --results-dir results/traceflow_cifar_50k --strict
+find data/imagenette_woof_320/train -mindepth 1 -maxdepth 1 -type d | wc -l
+
+find data/imagenette_woof_320/train -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.JPEG" -o -iname "*.png" -o -iname "*.webp" \) | wc -l
 ```
 
-Resolved private configs are written to `local_configs/resolved/`. Public result config copies redact `secret_key`.
+The merged Imagenette+Imagewoof train folder should have about 20 class folders.
+For ImageNet-1K follow the same ImageFolder layout and only change `data.root`,
+`model.num_classes`, and `naming.dataset_tag` in `configs/traceflow.yml`.
+
+## Preflight
+
+```bash
+python -B -m scripts.traceflow check-ready   --config configs/traceflow.yml   --bundle-dir /root/autodl-tmp/traceflow_runs/preflight_pro6000
+```
+
+## Data/VAE Diagnosis
+
+```bash
+python -B -m scripts.traceflow diagnose-data   --config configs/traceflow.yml   --bundle-dir /root/autodl-tmp/traceflow_runs/data_diagnosis_pro6000
+```
+
+Inspect:
+
+```text
+reports/data_diagnosis/real_grid.png
+reports/data_diagnosis/vae_recon_grid.png
+reports/data_diagnosis/dataset_report.md
+```
+
+## RTX PRO 6000 Benchmark
+
+```bash
+python -B -m scripts.traceflow benchmark-pro6000   --config configs/traceflow.yml   --bundle-dir /root/autodl-tmp/traceflow_runs/pro6000_benchmark   --steps 300   --detach
+```
+
+Watch:
+
+```bash
+tail -f /root/autodl-tmp/traceflow_runs/pro6000_benchmark/logs/main.log
+```
+
+Read report:
+
+```bash
+cat /root/autodl-tmp/traceflow_runs/pro6000_benchmark/reports/pro6000_benchmark.md
+```
+
+## Full Paper Run
+
+```bash
+python -B -m scripts.traceflow run-all   --config configs/traceflow.yml   --bundle-dir /root/autodl-tmp/traceflow_runs/paper_pro6000_imagenettewoof256   --detach
+```
+
+Watch:
+
+```bash
+tail -f /root/autodl-tmp/traceflow_runs/paper_pro6000_imagenettewoof256/logs/main.log
+```
+
+Download the completed bundle:
+
+```text
+/root/autodl-tmp/traceflow_runs/paper_pro6000_imagenettewoof256/
+```
+
+Resolved private configs are written under each bundle's `configs/` directory. Public config copies redact `secret_key`.

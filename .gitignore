@@ -2,9 +2,12 @@
 /outputs/
 /checkpoints/
 /data/
+/weights/
 /results/
 /attack_outputs/
 wandb/
+hf_cache/
+.codegraph/
 
 # Model weights
 *.pt
@@ -34,3 +37,8 @@ references/
 local_configs/
 
 logs/
+
+# Local model assets and generated reports
+/pretrained/
+/reports/
+*.safetensors

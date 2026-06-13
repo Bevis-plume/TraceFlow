@@ -82,6 +82,31 @@ def _resolve_device(device_str: str) -> torch.device:
     return torch.device(device_str)
 
 
+def _force_math_sdp_for_higher_order_grads(device: torch.device) -> None:
+    """Use the SDPA backend that supports inversion's higher-order gradients.
+
+    The inversion objective backpropagates through gradients. CUDA's flash and
+    memory-efficient SDPA kernels are fast for first-order training, but PyTorch
+    does not implement the derivative needed for this second backward pass.
+    Evaluation is correctness-first, so force the math backend here only.
+    """
+    if device.type != "cuda":
+        return
+    try:
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        torch.backends.cuda.enable_math_sdp(True)
+        print("[eval] SDPA backend: math only for higher-order gradients")
+    except Exception as exc:  # pragma: no cover - defensive for older PyTorch
+        print(f"[eval] warning: could not force math SDPA backend: {exc}")
+
+
+def _free_cuda(device: torch.device) -> None:
+    """Release cached CUDA blocks between expensive eval stages."""
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+
 # ---------------------------------------------------------------------------
 # Image-quality metrics (operate on [-1, 1] tensors)
 # ---------------------------------------------------------------------------
@@ -114,6 +139,14 @@ def _ssim(a: torch.Tensor, b: torch.Tensor) -> float:
     num = (2 * mu_x * mu_y + c1) * (2 * sig_xy + c2)
     den = (mu_x ** 2 + mu_y ** 2 + c1) * (sig_x + sig_y + c2)
     return (num / den).mean().item()
+
+
+def _quality_pair(a: torch.Tensor, b: torch.Tensor, prefix: str) -> Dict[str, Any]:
+    try:
+        from src.utils.quality_metrics import pair_quality
+        return pair_quality(a, b, prefix=prefix)
+    except Exception as exc:
+        return {f"{prefix}_metric_warning": str(exc)}
 
 
 # ---------------------------------------------------------------------------
@@ -260,7 +293,7 @@ def _load_source_images(
     cfg: Dict[str, Any],
     image_size: int,
     device: torch.device,
-) -> tuple[torch.Tensor, Dict[str, Any]]:
+) -> tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]:
     """Load the source image batch for inversion evaluation.
 
     ``random`` preserves the previous smoke/backward-compatible path.
@@ -274,6 +307,7 @@ def _load_source_images(
     if args.data_source == "random":
         x_orig = torch.randn(source_count, 3, image_size, image_size, device=device)
         x_orig = x_orig.tanh()
+        y_orig = torch.zeros(source_count, device=device, dtype=torch.long)
         source_info = {
             "data_source": "random",
             "sample_index": None,
@@ -284,11 +318,12 @@ def _load_source_images(
                 {"index": None, "filename": None}
                 for _ in range(source_count)
             ],
+            "labels": y_orig.detach().cpu().tolist(),
         }
         print(
             f"[eval] Using {source_count} random source image(s) | size={image_size}x{image_size}"
         )
-        return x_orig, source_info
+        return x_orig, y_orig, source_info
 
     from src.data.image_datasets import build_dataset
 
@@ -312,6 +347,7 @@ def _load_source_images(
         )
 
     images: List[torch.Tensor] = []
+    labels: List[int] = []
     source_samples: List[Dict[str, Any]] = []
     for idx in range(start_idx, end_idx):
         sample = dataset[idx]
@@ -321,14 +357,18 @@ def _load_source_images(
                 f"Dataset sample {idx} did not return a tensor image; got {type(image)!r}."
             )
         images.append(image)
+        label = sample[1] if isinstance(sample, (list, tuple)) and len(sample) > 1 else 0
+        labels.append(int(label))
         source_samples.append(
             {
                 "index": idx,
                 "filename": _sample_filename(dataset, idx),
+                "label": int(label),
             }
         )
 
     x_orig = torch.stack(images, dim=0).to(device)
+    y_orig = torch.tensor(labels, device=device, dtype=torch.long)
     source_info = {
         "data_source": "config",
         "sample_index": start_idx,
@@ -336,12 +376,13 @@ def _load_source_images(
         "dataset_name": data_cfg["name"],
         "dataset_root": data_cfg.get("root"),
         "samples": source_samples,
+        "labels": labels,
     }
     print(
         f"[eval] Using config dataset samples [{start_idx}:{end_idx}) from "
         f"{data_cfg['name']} | size={image_size}x{image_size}"
     )
-    return x_orig, source_info
+    return x_orig, y_orig, source_info
 
 
 # ---------------------------------------------------------------------------
@@ -436,6 +477,7 @@ def evaluate(args: argparse.Namespace) -> None:  # noqa: C901  (complex but sequ
 
     device = _resolve_device(cfg["project"].get("device", "auto"))
     print(f"[eval] Device: {device}")
+    _force_math_sdp_for_higher_order_grads(device)
 
     # ------------------------------------------------------------------
     # 2. Load checkpoint
@@ -556,6 +598,10 @@ def evaluate(args: argparse.Namespace) -> None:  # noqa: C901  (complex but sequ
             image_size=image_size,
             channels=3,
             hidden_dim=wm_cfg["extractor_hidden_dim"],
+            base_channels=wm_cfg.get("detector_base_channels", 64),
+            num_scales=wm_cfg.get("detector_num_scales", 4),
+            num_blocks=wm_cfg.get("detector_num_blocks", 2),
+            max_channels=wm_cfg.get("detector_max_channels", 768),
         ).to(device)
         extractor.load_state_dict(wm_state["extractor"])
         extractor.eval()
@@ -565,6 +611,9 @@ def evaluate(args: argparse.Namespace) -> None:  # noqa: C901  (complex but sequ
             channels=3,
             hidden_dim=wm_cfg["extractor_hidden_dim"],
             image_size=image_size,
+            base_channels=wm_cfg.get("adapter_base_channels", 64),
+            num_blocks=wm_cfg.get("adapter_num_blocks", 3),
+            max_channels=wm_cfg.get("adapter_max_channels", 512),
         ).to(device)
         decoder_adapter.load_state_dict(wm_state["decoder_adapter"])
         decoder_adapter.eval()
@@ -572,7 +621,10 @@ def evaluate(args: argparse.Namespace) -> None:  # noqa: C901  (complex but sequ
         latent_detector = TraceLatentDetector(
             bit_length=wm_cfg["bit_length"],
             latent_channels=ae_lc,
-            hidden_dim=wm_cfg.get("latent_detector_hidden_dim", 64),
+            hidden_dim=wm_cfg.get("latent_detector_hidden_dim", 128),
+            base_channels=wm_cfg.get("latent_detector_base_channels", 64),
+            num_blocks=wm_cfg.get("latent_detector_num_blocks", 3),
+            max_channels=wm_cfg.get("latent_detector_max_channels", 512),
         ).to(device)
         latent_detector.load_state_dict(wm_state["latent_detector"])
         latent_detector.eval()
@@ -595,8 +647,11 @@ def evaluate(args: argparse.Namespace) -> None:  # noqa: C901  (complex but sequ
     # ------------------------------------------------------------------
     # 7. Source images (random by default; config-backed for paper-valid eval)
     # ------------------------------------------------------------------
-    x_orig, source_info = _load_source_images(args, cfg, image_size, device)
+    x_orig, y_source, source_info = _load_source_images(args, cfg, image_size, device)
     B = x_orig.size(0)
+    y_target = y_source if m_cfg.get("class_conditional", False) else None
+    if y_target is not None:
+        print(f"[eval] Class labels: {y_target.detach().cpu().tolist()}")
 
     # ------------------------------------------------------------------
     # 8. Compute target gradients (defender side, with key)
@@ -614,6 +669,7 @@ def evaluate(args: argparse.Namespace) -> None:  # noqa: C901  (complex but sequ
         latent_transform=latent_transform,
         watermark_modules=watermark_modules,
         x=x_orig,
+        y=y_target,
         objective="traceflow",
     )
     n_valid = sum(1 for g in target_grads if g is not None)
@@ -621,7 +677,8 @@ def evaluate(args: argparse.Namespace) -> None:  # noqa: C901  (complex but sequ
     print(
         f"[eval] Fixed attack state: t.shape={tuple(attack_state.t.shape)} "
         f"eps.shape={tuple(attack_state.eps.shape)} "
-        f"bits={'None' if attack_state.bits is None else tuple(attack_state.bits.shape)}"
+        f"bits={'None' if attack_state.bits is None else tuple(attack_state.bits.shape)} "
+        f"y={'None' if attack_state.y is None else tuple(attack_state.y.shape)}"
     )
 
     # Save original grid
@@ -660,6 +717,9 @@ def evaluate(args: argparse.Namespace) -> None:  # noqa: C901  (complex but sequ
 
     run_latent = args.attack in ("latent", "both")
     run_pixel  = args.attack in ("pixel",  "both")
+    snapshot_steps = _parse_snapshot_steps(args.snapshot_steps, args.steps)
+    if snapshot_steps:
+        print(f"[eval] Attack snapshots: {snapshot_steps}")
 
     if args.attacker == "both":
         attacker_modes = ["no_key", "oracle_key"]
@@ -689,6 +749,7 @@ def evaluate(args: argparse.Namespace) -> None:  # noqa: C901  (complex but sequ
                 log_interval=max(1, args.steps // 5),
                 attacker=attacker,
                 latent_transform=latent_transform,
+                snapshot_steps=snapshot_steps,
             )
             latent_wall_time_s = time.time() - latent_t0
             z_k_dummy = latent_result["z_k_dummy"]
@@ -704,9 +765,25 @@ def evaluate(args: argparse.Namespace) -> None:  # noqa: C901  (complex but sequ
                 x_defender  = autoencoder.decode(z_recovered).cpu().clamp(-1, 1)
             _save_grid(x_defender, img_dir / f"latent_{attacker}_raw_defender_grid.png", nrow=max(1, B))
 
+            latent_snapshot_paths: Dict[str, Dict[str, str]] = {}
+            for snap_step, snap_z in latent_result.get("snapshots", {}).items():
+                with torch.no_grad():
+                    snap_z_dev = snap_z.to(device)
+                    snap_nokey = autoencoder.decode(snap_z_dev).cpu().clamp(-1, 1)
+                    snap_defender = autoencoder.decode(latent_transform.invert(snap_z_dev)).cpu().clamp(-1, 1)
+                nokey_path = img_dir / "attack_progress" / f"latent_{attacker}_step{snap_step:04d}_nokey.png"
+                defender_path = img_dir / "attack_progress" / f"latent_{attacker}_step{snap_step:04d}_defender.png"
+                _save_grid(snap_nokey, nokey_path, nrow=max(1, B))
+                _save_grid(snap_defender, defender_path, nrow=max(1, B))
+                latent_snapshot_paths[str(snap_step)] = {
+                    "no_key": str(nokey_path),
+                    "defender": str(defender_path),
+                }
+
             lat_metrics: Dict[str, Any] = {
                 "final_gml":   latent_result["final_gml"],
                 "gml_history": latent_result["gml_history"],
+                "snapshot_paths": latent_snapshot_paths,
                 "attack_wall_time_s": latent_wall_time_s,
                 "avg_attack_step_time_s": latent_wall_time_s / max(args.steps, 1),
                 "cuda_max_memory_allocated_MB": (
@@ -721,6 +798,8 @@ def evaluate(args: argparse.Namespace) -> None:  # noqa: C901  (complex but sequ
                 "defender_mse":  _mse(x_defender, x_orig.cpu()),
                 "defender_psnr": _psnr(x_defender, x_orig.cpu()),
                 "defender_ssim": _ssim(x_defender, x_orig.cpu()),
+                **_quality_pair(x_nokey, x_orig.cpu(), "no_key"),
+                **_quality_pair(x_defender, x_orig.cpu(), "defender"),
             }
 
             if has_wm and batch_bits is not None:
@@ -779,6 +858,8 @@ def evaluate(args: argparse.Namespace) -> None:  # noqa: C901  (complex but sequ
                 print(f"[eval] latent[{attacker}] final_gml={latent_result['final_gml']:.6f} (no watermark)")
 
             run_metrics["latent_attack"] = lat_metrics
+            del latent_result, z_k_dummy
+            _free_cuda(device)
 
         # --------------------------------------------------------------
         # 9b. Pixel inversion attack
@@ -799,14 +880,22 @@ def evaluate(args: argparse.Namespace) -> None:  # noqa: C901  (complex but sequ
                 log_interval=max(1, args.steps // 5),
                 attacker=attacker,
                 latent_transform=latent_transform,
+                snapshot_steps=snapshot_steps,
             )
             pixel_wall_time_s = time.time() - pixel_t0
             x_recon = pixel_result["x_dummy"].cpu().clamp(-1, 1)
             _save_grid(x_recon, img_dir / f"pixel_{attacker}_raw_recon_grid.png", nrow=max(1, B))
 
+            pixel_snapshot_paths: Dict[str, str] = {}
+            for snap_step, snap_x in pixel_result.get("snapshots", {}).items():
+                snap_path = img_dir / "attack_progress" / f"pixel_{attacker}_step{snap_step:04d}.png"
+                _save_grid(snap_x.clamp(-1, 1), snap_path, nrow=max(1, B))
+                pixel_snapshot_paths[str(snap_step)] = str(snap_path)
+
             px_metrics: Dict[str, Any] = {
                 "final_gml":   pixel_result["final_gml"],
                 "gml_history": pixel_result["gml_history"],
+                "snapshot_paths": pixel_snapshot_paths,
                 "attack_wall_time_s": pixel_wall_time_s,
                 "avg_attack_step_time_s": pixel_wall_time_s / max(args.steps, 1),
                 "cuda_max_memory_allocated_MB": (
@@ -816,6 +905,7 @@ def evaluate(args: argparse.Namespace) -> None:  # noqa: C901  (complex but sequ
                 "mse":  _mse(x_recon, x_orig.cpu()),
                 "psnr": _psnr(x_recon, x_orig.cpu()),
                 "ssim": _ssim(x_recon, x_orig.cpu()),
+                **_quality_pair(x_recon, x_orig.cpu(), "pixel"),
             }
 
             if has_wm and batch_bits is not None:
@@ -865,8 +955,11 @@ def evaluate(args: argparse.Namespace) -> None:  # noqa: C901  (complex but sequ
                 print(f"[eval] pixel[{attacker}] final_gml={pixel_result['final_gml']:.6f} (no watermark)")
 
             run_metrics["pixel_attack"] = px_metrics
+            del pixel_result
+            _free_cuda(device)
 
         metrics["attacker_runs"][attacker] = run_metrics
+        _free_cuda(device)
 
     # ------------------------------------------------------------------
     # 10. Save metrics JSON (no secret_key in output)
@@ -880,6 +973,24 @@ def evaluate(args: argparse.Namespace) -> None:  # noqa: C901  (complex but sequ
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+def _parse_snapshot_steps(spec: str, total_steps: int) -> List[int]:
+    if not spec:
+        return []
+    if spec.strip().lower() in {"none", "off", "false", "0"}:
+        return []
+    values: List[int] = []
+    for raw in spec.split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        step = int(raw)
+        if 0 < step <= total_steps and step not in values:
+            values.append(step)
+    if total_steps > 0 and total_steps not in values:
+        values.append(total_steps)
+    return sorted(values)
+
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -905,6 +1016,15 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument("--steps",      type=int,   default=300,   help="Optimisation steps.")
     p.add_argument("--lr",         type=float, default=0.01,  help="Adam learning rate.")
+    p.add_argument(
+        "--snapshot-steps",
+        default="10,20,30,40,50,60,70,80,90,100",
+        help=(
+            "Comma-separated attack steps to save as progress grids. "
+            "Steps larger than --steps are ignored; the final step is always added. "
+            "Use 'none' to disable."
+        ),
+    )
     p.add_argument("--batch-size", type=int,   default=1,
                    dest="batch_size", help="Number of images to attack (default 1).")
     p.add_argument(

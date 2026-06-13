@@ -210,6 +210,93 @@ def checkpoint_path(
     return root / run_name / "latest.pt"
 
 
+def resolve_checkpoint(
+    *,
+    run_name: str,
+    config_path: Optional[str] = None,
+    explicit: Optional[str] = None,
+) -> Path:
+    """Resolve the checkpoint an experiment should use.
+
+    ``explicit`` is used by eval-only workflows that reuse an already-trained
+    checkpoint.  When omitted, the canonical checkpoint path for ``run_name``
+    is returned so existing train-then-eval workflows keep their old behavior.
+    """
+    if explicit:
+        return Path(explicit).expanduser()
+    return checkpoint_path(run_name, config_path=config_path)
+
+
+def infer_run_dir_from_checkpoint(
+    checkpoint: Path,
+    *,
+    run_name: str,
+    config_path: Optional[str] = None,
+) -> Path:
+    """Infer a training output directory from a checkpoint path.
+
+    Bundle checkpoints follow ``<bundle>/checkpoints/<run_name>/latest.pt`` and
+    their logs live at ``<bundle>/outputs/<run_name>``.  For arbitrary external
+    checkpoints, fall back to the canonical output path from the active config.
+    """
+    ckpt = Path(checkpoint).expanduser()
+    if ckpt.name.endswith(".pt") and ckpt.parent.name == run_name:
+        ckpt_root = ckpt.parent.parent
+        bundle_root = ckpt_root.parent
+        if ckpt_root.name == "checkpoints":
+            candidate = bundle_root / "outputs" / run_name
+            if candidate.exists():
+                return candidate
+    return train_output_dir(run_name, config_path=config_path)
+
+
+def checkpoint_exists(checkpoint: Path, *, dry_run: bool = False) -> bool:
+    """Treat dry-runs as valid while checking real checkpoint existence otherwise."""
+    return dry_run or Path(checkpoint).expanduser().exists()
+
+
+def should_train_for_policy(train_policy: str, checkpoint: Path, *, dry_run: bool = False) -> bool:
+    """Return whether an experiment should run training before evaluation."""
+    policy = (train_policy or "always").lower()
+    if policy == "always":
+        return True
+    if policy == "missing":
+        return not checkpoint_exists(checkpoint, dry_run=dry_run)
+    if policy == "never":
+        return False
+    raise ValueError(f"Unknown train_policy={train_policy!r}; expected always, missing, or never")
+
+
+def write_skipped_metrics(
+    *,
+    exp_id: str,
+    exp_dir: Path,
+    output_base: Path,
+    config_path: str,
+    run_name: str,
+    smoke: bool,
+    checkpoint: Path,
+    reason: str,
+    validation_warnings: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Write explicit skipped metrics for eval-only runs missing an optional ckpt."""
+    metrics: Dict[str, Any] = {
+        "exp_id": exp_id,
+        "config": config_path,
+        "smoke": smoke,
+        "run_name": run_name,
+        "status": "skipped_missing_checkpoint",
+        "checkpoint": str(checkpoint),
+        "reason": reason,
+        "validation_warnings": validation_warnings or [],
+    }
+    write_json(exp_dir / "metrics.json", metrics)
+    append_csv_row(output_base / "all_metrics.csv", metrics)
+    print(f"[{exp_id}] skipped: {reason}")
+    print(f"[{exp_id}] Metrics written: {exp_dir / 'metrics.json'}")
+    return {"status": metrics["status"], "exp_id": exp_id, "metrics": metrics, "output_dir": str(exp_dir)}
+
+
 def select_default_config(
     *,
     smoke: bool,

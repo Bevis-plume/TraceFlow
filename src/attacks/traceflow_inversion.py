@@ -32,7 +32,7 @@ where θ are the FlowTransformer parameters.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -63,12 +63,14 @@ class AttackBatchState:
     t: torch.Tensor
     eps: torch.Tensor
     bits: Optional[torch.Tensor]
+    y: Optional[torch.Tensor] = None
 
     def to(self, device: torch.device) -> "AttackBatchState":
         return AttackBatchState(
             t=self.t.to(device),
             eps=self.eps.to(device),
             bits=None if self.bits is None else self.bits.to(device),
+            y=None if self.y is None else self.y.to(device),
         )
 
 
@@ -98,6 +100,7 @@ def _traceflow_loss_from_latent(
     t: Optional[torch.Tensor] = None,
     eps: Optional[torch.Tensor] = None,
     bits: Optional[torch.Tensor] = None,
+    y: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Compute the full TraceFlow training loss for a given latent ``z_k``.
 
@@ -120,12 +123,12 @@ def _traceflow_loss_from_latent(
 
     if watermark_modules is None or not watermark_modules.get("enabled", False):
         # Flow-only path — still honour fixed (t, eps) for determinism.
-        return flow_loss_with_state(model, z_k, t=t, eps=eps)["loss"]
+        return flow_loss_with_state(model, z_k, y=y, t=t, eps=eps)["loss"]
 
     wm_cfg = watermark_modules["config"]
     wm_type = watermark_modules["type"]
 
-    flow_state = flow_loss_with_state(model, z_k, t=t, eps=eps)
+    flow_state = flow_loss_with_state(model, z_k, y=y, t=t, eps=eps)
     flow_l = flow_state["loss"]
 
     if wm_type != "traceflow":
@@ -164,10 +167,35 @@ def _traceflow_loss_from_latent(
     wm_latent_l = bce(bit_logits_latent, batch_bits)
     cycle_l = F.mse_loss(z_re_k, z_hat_k.detach())
 
+    wm_robust_l = torch.zeros((), device=z_k.device, dtype=flow_l.dtype)
+    if wm_cfg.get("robustness_enabled", False) and wm_cfg.get("lambda_wm_robust", 0.0) > 0:
+        from src.watermarking.augment import deterministic_robust_views
+        robust_losses = []
+        max_views = int(wm_cfg.get("robust_max_views", 2))
+        robust_latent_enabled = bool(wm_cfg.get("robust_latent_enabled", False))
+        robust_detach_input = bool(wm_cfg.get("robust_detach_input", True))
+
+        # Training usually detaches robust views so they train the detector
+        # without pushing second-order gradients through the model/VAE path.
+        # This inversion objective matches only FlowTransformer parameter
+        # gradients, so a detached robust branch contributes no useful target
+        # signal and only explodes memory. Skip it rather than building a graph
+        # that cannot affect the matched gradients.
+        if not robust_detach_input:
+            for x_view in deterministic_robust_views(x_w)[1:1 + max(0, max_views)]:
+                robust_losses.append(bce(extractor.logits(x_view), batch_bits))
+                if robust_latent_enabled:
+                    z_view = autoencoder.encode_with_grad(x_view)
+                    z_view_k = latent_transform(z_view)
+                    robust_losses.append(bce(latent_detector.logits(z_view_k), batch_bits))
+            if robust_losses:
+                wm_robust_l = torch.stack(robust_losses).mean()
+
     loss = (
         flow_l
         + wm_cfg["lambda_wm_img"]     * wm_img_l
         + wm_cfg["lambda_wm_latent"]  * wm_latent_l
+        + wm_cfg.get("lambda_wm_robust", 0.0) * wm_robust_l
         + wm_cfg["lambda_img"]        * img_l
         + wm_cfg["lambda_cycle"]      * cycle_l
         + wm_cfg["lambda_residual"]   * residual_l
@@ -243,6 +271,7 @@ def compute_target_gradients(
     latent_transform: Any,
     watermark_modules: Optional[Dict[str, Any]],
     x: torch.Tensor,
+    y: Optional[torch.Tensor] = None,
     objective: str = "traceflow",
 ) -> Tuple[List[Optional[torch.Tensor]], AttackBatchState]:
     """Compute defender-side gradient signals on a real image batch.
@@ -294,17 +323,18 @@ def compute_target_gradients(
         from src.watermarking.message import expand_bits
         fixed_bits = expand_bits(watermark_modules["bits"], B).to(device)
 
-    attack_state = AttackBatchState(t=fixed_t, eps=fixed_eps, bits=fixed_bits)
+    fixed_y = None if y is None else y.to(device=device, dtype=torch.long)
+    attack_state = AttackBatchState(t=fixed_t, eps=fixed_eps, bits=fixed_bits, y=fixed_y)
 
     if objective == "flow_only" or watermark_modules is None:
         from src.generation.rectified_flow import flow_loss_with_state
         loss = flow_loss_with_state(
-            model, z_k, t=fixed_t, eps=fixed_eps
+            model, z_k, y=fixed_y, t=fixed_t, eps=fixed_eps
         )["loss"]
     else:
         loss = _traceflow_loss_from_latent(
             model, autoencoder, latent_transform, watermark_modules, z_k,
-            t=fixed_t, eps=fixed_eps, bits=fixed_bits,
+            t=fixed_t, eps=fixed_eps, bits=fixed_bits, y=fixed_y,
         )
 
     loss.backward()
@@ -350,6 +380,7 @@ def latent_inversion_attack(
     log_interval: int = 50,
     attacker: str = "no_key",
     latent_transform: Optional[Any] = None,
+    snapshot_steps: Optional[Sequence[int]] = None,
 ) -> Dict[str, Any]:
     """Gradient-matching attack in latent space.
 
@@ -385,6 +416,8 @@ def latent_inversion_attack(
 
     model_params = list(model.parameters())
     gml_history: List[float] = []
+    snapshot_set = {int(s) for s in (snapshot_steps or []) if int(s) > 0}
+    snapshots: Dict[int, torch.Tensor] = {}
 
     was_training = model.training
     model.eval()
@@ -398,7 +431,7 @@ def latent_inversion_attack(
             # Dummy loss uses the SAME fixed (t, eps, bits) as the target.
             loss = _traceflow_loss_from_latent(
                 model, autoencoder, dummy_transform, watermark_modules, z_k_dummy,
-                t=attack_state.t, eps=attack_state.eps, bits=attack_state.bits,
+                t=attack_state.t, eps=attack_state.eps, bits=attack_state.bits, y=attack_state.y,
             )
             dummy_grads = _model_param_grads(loss, model_params)
 
@@ -408,6 +441,8 @@ def latent_inversion_attack(
 
             gml_val = gml.item()
             gml_history.append(gml_val)
+            if (step + 1) in snapshot_set:
+                snapshots[step + 1] = z_k_dummy.detach().cpu()
             if log_interval > 0 and (step + 1) % log_interval == 0:
                 print(f"  [latent_inv:{attacker}] step={step+1:4d}  gml={gml_val:.6f}")
     finally:
@@ -419,6 +454,7 @@ def latent_inversion_attack(
         "gml_history": gml_history,
         "final_gml": gml_history[-1] if gml_history else float("nan"),
         "attacker": attacker,
+        "snapshots": snapshots,
     }
 
 
@@ -435,6 +471,7 @@ def pixel_inversion_attack(
     log_interval: int = 50,
     attacker: str = "no_key",
     latent_transform: Optional[Any] = None,
+    snapshot_steps: Optional[Sequence[int]] = None,
 ) -> Dict[str, Any]:
     """Gradient-matching attack in pixel space.
 
@@ -471,6 +508,8 @@ def pixel_inversion_attack(
 
     model_params = list(model.parameters())
     gml_history: List[float] = []
+    snapshot_set = {int(s) for s in (snapshot_steps or []) if int(s) > 0}
+    snapshots: Dict[int, torch.Tensor] = {}
 
     was_training = model.training
     model.eval()
@@ -485,7 +524,7 @@ def pixel_inversion_attack(
             z_dummy = autoencoder.encode_with_grad(x_dummy)
             loss = _traceflow_loss_from_latent(
                 model, autoencoder, dummy_transform, watermark_modules, z_dummy,
-                t=attack_state.t, eps=attack_state.eps, bits=attack_state.bits,
+                t=attack_state.t, eps=attack_state.eps, bits=attack_state.bits, y=attack_state.y,
             )
             dummy_grads = _model_param_grads(loss, model_params)
 
@@ -499,6 +538,8 @@ def pixel_inversion_attack(
 
             gml_val = gml.item()
             gml_history.append(gml_val)
+            if (step + 1) in snapshot_set:
+                snapshots[step + 1] = x_dummy.detach().cpu()
             if log_interval > 0 and (step + 1) % log_interval == 0:
                 print(f"  [pixel_inv:{attacker}] step={step+1:4d}  gml={gml_val:.6f}")
     finally:
@@ -510,4 +551,5 @@ def pixel_inversion_attack(
         "gml_history": gml_history,
         "final_gml": gml_history[-1] if gml_history else float("nan"),
         "attacker": attacker,
+        "snapshots": snapshots,
     }

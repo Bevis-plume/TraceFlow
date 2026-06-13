@@ -17,8 +17,11 @@ tqdm>=4.66.0
 # --- Numerical computing ---
 numpy>=1.26.0
 
-# --- Image quality metrics (optional but recommended) ---
+# --- Image quality metrics / paper evaluation ---
 scikit-image>=0.22.0
+torchmetrics>=1.4.0
+torch-fidelity>=0.3.0
+lpips>=0.1.4
 
 # --- Visualisation ---
 matplotlib>=3.8.0

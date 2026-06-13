@@ -69,6 +69,9 @@ def check(results_dir: Path) -> List[str]:
             _warn(warnings, f"invalid metrics JSON for {exp_id}")
             continue
         print(f"[readiness] {exp_id}: found {mode_dir / 'metrics.json'}")
+        if metrics.get("status") == "skipped_missing_checkpoint":
+            _warn(warnings, f"{exp_id} skipped because checkpoint was not provided: {metrics.get('reason')}")
+            continue
 
         if exp_id in {"exp03", "exp04", "exp05"}:
             if metrics.get("generated_image_bit_acc") is None:

@@ -181,10 +181,16 @@ class SelfAttention(nn.Module):
         qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, H, N, d)
         q, k, v = qkv.unbind(0)            # each (B, H, N, d)
 
-        scale = self.head_dim ** -0.5
-        attn = (q @ k.transpose(-2, -1)) * scale   # (B, H, N, N)
-        attn = attn.softmax(dim=-1)
-        out = (attn @ v).transpose(1, 2).reshape(B, N, D)
+        # PyTorch SDPA dispatches to Flash / memory-efficient kernels on CUDA
+        # during normal training. Inversion eval explicitly forces math SDPA
+        # because it needs higher-order gradients.
+        out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            dropout_p=0.0,
+            is_causal=False,
+        ).transpose(1, 2).reshape(B, N, D)
         return self.proj(out)
 
 

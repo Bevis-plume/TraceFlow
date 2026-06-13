@@ -3,57 +3,151 @@
 # choose between many YAML files anymore.
 
 traceflow:
-  name: traceflow-cifar-50k
+  name: traceflow
   mode: full                 # smoke | full
-  output_dir: results/traceflow_cifar_50k
+  output_dir: results/traceflow
   figures: true
   readiness: true
   training_figures: true
 
+# One naming block controls run names, bundle names, and experiment names.
+# Change dataset_tag/budget_tag/num_steps here and under training; do not edit code.
+naming:
+  project: traceflow
+  dataset_tag: imagenettewoof256
+  budget_tag: paper
+  templates:
+    check_ready: "{project}-{dataset}-preflight"
+    diagnose_data: "{project}-{dataset}-data-diagnosis"
+    benchmark_pro6000: "{project}-{dataset}-pro6000-benchmark"
+    train_generator: "{project}-{dataset}-generator"
+    train_keyed: "{project}-{dataset}-exp02-keyed"
+    train_identity: "{project}-{dataset}-exp03-identity"
+    train_final: "{project}-{dataset}-final"
+    run_all: "{project}-{dataset}-paper-all"
+    eval_all: "{project}-{dataset}-paper-eval"
+    exp01: "{project}-{dataset}-exp01-baseline"
+    exp02: "{project}-{dataset}-exp02-keyed"
+    exp03: "{project}-{dataset}-exp03-identity"
+    exp04: "{project}-{dataset}-exp04-traceflow"
+    exp05: "{project}-{dataset}-exp05-robustness"
+
 artifact_bundle:
-  # On AutoDL/server runs, prefer the data disk:
-  #   /root/autodl-tmp/traceflow_runs/<run_name>
-  # For local development this relative default keeps artifacts in the repo.
-  root: runs/traceflow-cifar-50k
+  # On AutoDL/server runs, pass --bundle-dir /root/autodl-tmp/traceflow_runs/<name>.
+  # The default is local and template-driven for development.
+  root: runs/{project}-{dataset}
+
+assets:
+  # Project-local assets. Include these directories when packaging for server.
+  data_dir: data
+  weights_dir: weights
+  dataset:
+    name: imagenette2-320
+    url: https://s3.amazonaws.com/fast-ai-imageclas/imagenette2-320.tgz
+    archive: data/imagenette2-320.tgz
+    extract_dir: data
+    root: data/imagenette2-320
+    train_root: data/imagenette2-320/train
+    min_size_mb: 250
+  extra_datasets:
+    - name: imagewoof2-320
+      url: https://s3.amazonaws.com/fast-ai-imageclas/imagewoof2-320.tgz
+      archive: data/imagewoof2-320.tgz
+      extract_dir: data
+      root: data/imagewoof2-320
+      train_root: data/imagewoof2-320/train
+      min_size_mb: 250
+  combined_dataset:
+    enabled: true
+    name: imagenette_woof_320
+    root: data/imagenette_woof_320
+    train_root: data/imagenette_woof_320/train
+    link_mode: hardlink        # hardlink saves disk; falls back to copy if unsupported
+    sources:
+      - data/imagenette2-320/train
+      - data/imagewoof2-320/train
+  metric_weights:
+    enabled: true
+    torch_home: weights/torch
+    hf_home: weights/huggingface
 
 runtime:
   detach_default: false       # set true on server if you usually want nohup background runs
   make_archive: false         # optional .tar.gz packaging after a foreground run
 
+hardware:
+  profile: rtx_pro_6000_96gb
+
+run_all:
+  train_policy: missing       # missing | always; run-all trains missing weights then reuses them for eval
+  force_train: false
+  reuse_within_bundle: true
+  diagnose_data: true
+  oom_retry: true
+
+checkpoints:
+  # Optional project-local checkpoint registry for `python -m scripts.traceflow eval-all`.
+  # Put reused weights here after copying a trained bundle back into a fresh project.
+  # CLI flags such as --traceflow-checkpoint override these values.
+  generator: checkpoints/reuse/generator/latest.pt
+  traceflow: checkpoints/reuse/traceflow/latest.pt
+  keyed: checkpoints/reuse/keyed/latest.pt
+  traceflow_identity: checkpoints/reuse/identity/latest.pt
+
+evaluation:
+  train_missing: false        # eval-all reuses checkpoints by default; set true only to fill missing ablations
+  attack_steps: 100
+  require_traceflow_checkpoint: true
+  allow_skipped_ablations: true
+
 entries:
-  check_ready:
-    run_name: traceflow-cifar50k-preflight
-  train_generator:
-    run_name: traceflow-cifar50k-generator
-  train_final:
-    run_name: traceflow-cifar50k-final
-    # Full TraceFlow uses bf16 plus a 5090-oriented micro-batch. If your server
-    # still OOMs, override to batch_size=12 and grad_accum_steps=6.
+  check_ready: {}
+  train_generator: {}
+  train_keyed:
+    overrides:
+      training:
+        batch_size: 96
+        grad_accum_steps: 1
+        mixed_precision: bf16
+  train_identity:
     overrides:
       training:
         batch_size: 16
-        grad_accum_steps: 4
+        grad_accum_steps: 1
+        mixed_precision: bf16
+  train_final:
+    # Heavy TraceFlow watermark path default. The bottleneck is the VAE
+    # decode/re-encode + ResUNet adapter + detector path, not the DiT. Use a
+    # larger micro-batch with no accumulation for throughput; the small
+    # Imagenette+Imagewoof dataset does not need effective batch 96.
+    overrides:
+      training:
+        batch_size: 16
+        grad_accum_steps: 1
         mixed_precision: bf16
   run_all:
-    run_name: traceflow-cifar50k-paper-all
     overrides:
       training:
-        batch_size: 16
-        grad_accum_steps: 4
         mixed_precision: bf16
+  eval_all: {}
 
 project:
-  name: traceflow-cifar-50k
+  name: traceflow
   seed: 42
   device: cuda               # use auto for local smoke on Mac/CPU
   output_dir: outputs/flow_transformer
 
 data:
-  name: cifar10              # random | cifar10 | imagefolder | flat
-  root: ./data               # for imagefolder, set to ./data/images_256 or your dataset path
+  # Fast paper/default runs use Imagenette-320 + Imagewoof-320 merged as native
+  # high-quality ImageFolder data. For larger final experiments, override
+  # root/num_classes to ImageNet/ImageFolder.
+  name: imagefolder          # random | cifar10 | imagefolder | flat
+  root: data/imagenette_woof_320/train
   image_size: 256
-  num_workers: 8
+  num_workers: 12
   pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 4
   download: false
 
 autoencoder:
@@ -70,20 +164,22 @@ model:
   latent_channels: 4
   latent_size: 32
   patch_size: 2
-  hidden_size: 512
+  hidden_size: 384
   depth: 12
-  num_heads: 8
+  num_heads: 6
   mlp_ratio: 4.0
   dropout: 0.0
-  class_conditional: false
-  num_classes: null
+  class_conditional: true
+  num_classes: 20
 
 training:
-  # Generator-friendly RTX 5090 default. Full TraceFlow uses entry-level
-  # overrides below because the watermark path adds a decode/re-encode cycle.
-  batch_size: 24
-  grad_accum_steps: 3
-  num_steps: 50000           # change this to 5000 / 20000 / 50000 / 400000 as needed
+  # RTX PRO 6000 96GB default for a time-bounded first paper run. Generator/keyed
+  # use this 96x1 setting; full TraceFlow and identity override to 24x4 because
+  # the watermark path is heavier. Raise num_steps to 70000/100000 only after the
+  # 50k bundle confirms sample quality and watermark metrics are worth extending.
+  batch_size: 96
+  grad_accum_steps: 1
+  num_steps: 50000
   learning_rate: 1.0e-4
   weight_decay: 0.01
   warmup_steps: 5000
@@ -91,7 +187,8 @@ training:
   mixed_precision: bf16      # none | bf16 | fp16
   fused_optimizer: true      # CUDA AdamW fused path when supported
   matmul_precision: high     # high gives faster TF32 matmuls for fp32 fallbacks
-  clean_fp_interval: 500     # clean false-positive diagnostics are expensive; 0 disables
+  torch_compile: false       # optional; disabled by default for long-run stability
+  clean_fp_interval: 1000    # clean false-positive diagnostics are expensive; 0 disables
   log_interval: 50
   sample_interval: 5000
   save_interval: 10000
@@ -114,7 +211,7 @@ smoke:
 security:
   latent_transform:
     type: keyed              # exp01/exp03 override this to identity automatically
-    secret_key: CHANGE_ME_IN_LOCAL_COPY
+    secret_key: tf_09d98d632229889c92ebd65bf372d63cdfd63e49d6d3a44d77d5e52bb599d447
     block_size: 16
     bias_scale: 0.1
 
@@ -123,16 +220,53 @@ watermark:
   type: traceflow
   bit_length: 32
   seed: 1234
-  alpha: 0.02
-  extractor_hidden_dim: 128
+  alpha: 0.10
+  extractor_hidden_dim: 384
+  adapter_base_channels: 96
+  adapter_num_blocks: 3
+  adapter_max_channels: 512
+  adapter_carrier_strength: 0.6
+  adapter_carrier_grid_size: 32
+  detector_base_channels: 96
+  detector_num_scales: 5
+  detector_num_blocks: 3
+  detector_max_channels: 768
+  detector_carrier_grid_size: 32
+  detector_carrier_weight: 0.10
   latent_channels: 4
-  latent_detector_hidden_dim: 64
+  latent_detector_hidden_dim: 192
+  latent_detector_base_channels: 96
+  latent_detector_num_blocks: 4
+  latent_detector_max_channels: 512
   message_mode: random_per_sample
-  lambda_wm_img: 1.0
-  lambda_wm_latent: 0.5
-  lambda_img: 0.1
-  lambda_cycle: 0.1
-  lambda_residual: 0.01
+  lambda_wm_img: 0.4
+  lambda_wm_latent: 4.0
+  lambda_img: 0.05
+  lambda_cycle: 0.03
+  lambda_residual: 0.0008
+  robustness_enabled: true
+  robust_max_views: 1
+  robust_batch_size: 4
+  robust_chunk_size: 2
+  robust_detach_input: true
+  robust_latent_enabled: false
+  image_warmup_detach_until: 20000
+  carrier_schedule_enabled: true
+  carrier_schedule_start: 10000
+  carrier_schedule_steps: 20000
+  carrier_schedule_min_scale: 0.05
+  lambda_wm_robust: 0.1
+  lambda_clean_negative: 0.1
+  clean_negative_batch_size: 4
+  clean_negative_chunk_size: 2
+  lambda_perceptual: 0.05
+  lambda_frequency: 0.01
+  schedule_warmup_steps: 5000
+  schedule_main_steps: 5000
+  schedule_robust_start: 30000
+  schedule_robust_steps: 25000
+  schedule_polish_start: 45000
+  schedule_polish_steps: 5000
   cycle_target: protected_latent
   save_bits: true
   detection_threshold_acc: 0.9
@@ -143,22 +277,18 @@ experiments:
   exp01:
     enabled: true
     method: baseline
-    run_name: traceflow-cifar50k-exp01-baseline
 
   exp02:
     enabled: true
     method: keyed
-    run_name: traceflow-cifar50k-exp02-keyed
 
   exp03:
     enabled: true
     method: traceflow_identity
-    run_name: traceflow-cifar50k-exp03-identity
 
   exp04:
     enabled: true
     method: traceflow
-    run_name: traceflow-cifar50k-exp04-traceflow
     attack: latent
     attack_steps: 100
     attacker: no_key
@@ -166,7 +296,6 @@ experiments:
   exp05:
     enabled: true
     method: traceflow
-    run_name: traceflow-cifar50k-exp05-robustness
     attack_steps: 100
 
 postprocess:

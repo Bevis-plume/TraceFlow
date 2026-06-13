@@ -199,6 +199,19 @@ def sample(args: argparse.Namespace) -> None:
     print(f"[sample] Model loaded. Generating {num_samples} samples | "
           f"sampler={sampler} | steps={steps}")
 
+    # Optional class conditioning, matching DiT/SiT ImageNet-style training.
+    y = None
+    if m_cfg.get("class_conditional", False):
+        num_classes = int(m_cfg.get("num_classes") or cfg.get("model", {}).get("num_classes") or 1000)
+        if args.class_id is not None:
+            if args.class_id < 0 or args.class_id >= num_classes:
+                raise ValueError(f"--class-id must be in [0, {num_classes - 1}], got {args.class_id}")
+            y = torch.full((num_samples,), int(args.class_id), device=device, dtype=torch.long)
+            print(f"[sample] Class conditioning: fixed class_id={args.class_id}")
+        else:
+            y = torch.randint(num_classes, (num_samples,), device=device, dtype=torch.long)
+            print(f"[sample] Class conditioning: random labels in [0, {num_classes - 1}]")
+
     # ------------------------------------------------------------------
     # 6. Sample
     # ------------------------------------------------------------------
@@ -210,9 +223,9 @@ def sample(args: argparse.Namespace) -> None:
 
     with torch.no_grad():
         if sampler == "heun":
-            z0_k = sample_heun(model, latent_shape, steps, device)
+            z0_k = sample_heun(model, latent_shape, steps, device, y=y)
         else:
-            z0_k = sample_euler(model, latent_shape, steps, device)
+            z0_k = sample_euler(model, latent_shape, steps, device, y=y)
 
         # Defender-side inversion: z_0_k → z_0 (AE latent space).
         # For identity transform this is a no-op; for keyed it undoes the key rotation.
@@ -253,6 +266,7 @@ def sample(args: argparse.Namespace) -> None:
             detection_passed,
             image_delta_mse,
         )
+        from src.utils.quality_metrics import pair_quality
 
         wm_cfg = wm_state["config"]
         wm_type = wm_state.get("type", wm_cfg.get("type", "traceflow"))
@@ -265,6 +279,10 @@ def sample(args: argparse.Namespace) -> None:
             image_size=wm_image_size,
             channels=3,
             hidden_dim=wm_cfg["extractor_hidden_dim"],
+            base_channels=wm_cfg.get("detector_base_channels", 64),
+            num_scales=wm_cfg.get("detector_num_scales", 4),
+            num_blocks=wm_cfg.get("detector_num_blocks", 2),
+            max_channels=wm_cfg.get("detector_max_channels", 768),
         ).to(device)
         extractor.load_state_dict(wm_state["extractor"])
         extractor.eval()
@@ -274,6 +292,9 @@ def sample(args: argparse.Namespace) -> None:
             channels=3,
             hidden_dim=wm_cfg["extractor_hidden_dim"],
             image_size=wm_image_size,
+            base_channels=wm_cfg.get("adapter_base_channels", 64),
+            num_blocks=wm_cfg.get("adapter_num_blocks", 3),
+            max_channels=wm_cfg.get("adapter_max_channels", 512),
         ).to(device)
         decoder_adapter.load_state_dict(wm_state["decoder_adapter"])
         decoder_adapter.eval()
@@ -281,7 +302,10 @@ def sample(args: argparse.Namespace) -> None:
         latent_det = TraceLatentDetector(
             bit_length=wm_cfg["bit_length"],
             latent_channels=ae_latent_channels,
-            hidden_dim=wm_cfg.get("latent_detector_hidden_dim", 64),
+            hidden_dim=wm_cfg.get("latent_detector_hidden_dim", 128),
+            base_channels=wm_cfg.get("latent_detector_base_channels", 64),
+            num_blocks=wm_cfg.get("latent_detector_num_blocks", 3),
+            max_channels=wm_cfg.get("latent_detector_max_channels", 512),
         ).to(device)
         latent_det.load_state_dict(wm_state["latent_detector"])
         latent_det.eval()
@@ -301,6 +325,7 @@ def sample(args: argparse.Namespace) -> None:
             ber = bit_error_rate(probs, batch_bits)
             passed = detection_passed(probs, batch_bits, wm_cfg["detection_threshold_acc"])
             dmse = image_delta_mse(images_w, imgs_dev)
+            invisibility_metrics = pair_quality(images_w, imgs_dev, prefix="watermarked_vs_clean")
             z_re = autoencoder.encode(images_w)
             z_re_k = latent_transform(z_re)
             probs_latent = latent_det(z_re_k)
@@ -326,6 +351,7 @@ def sample(args: argparse.Namespace) -> None:
             "ber_latent": ber_latent,
             "detection_passed": passed,
             "image_delta_mse": dmse,
+            **invisibility_metrics,
             "num_samples": num_samples,
         }
         wm_metrics_path = output_dir / "watermark_metrics.json"
@@ -351,6 +377,7 @@ def sample(args: argparse.Namespace) -> None:
         "latent_shape": list(latent_shape),
         "model_cfg": m_cfg,
         "transform_type": transform_type,
+        "class_labels": None if y is None else y.detach().cpu().tolist(),
     }
     cfg_path = output_dir / "sampling_config.json"
     with open(cfg_path, "w") as f:
@@ -373,6 +400,7 @@ def _parse_args() -> argparse.Namespace:
         help="ODE integrator. Defaults to config value or 'euler'.",
     )
     parser.add_argument("--seed", type=int, default=None, help="RNG seed for reproducible samples.")
+    parser.add_argument("--class-id", type=int, default=None, help="Fixed class label for class-conditional checkpoints. Defaults to random labels.")
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--no-ema", action="store_true", help="Do not use EMA weights.")
     return parser.parse_args()

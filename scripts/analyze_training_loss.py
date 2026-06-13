@@ -88,12 +88,13 @@ def analyze(run_dir: Path, output_dir: Path) -> Dict[str, Any]:
 
     keys = [
         "loss", "loss_flow", "loss_wm_img", "loss_wm_latent", "loss_img",
-        "loss_cycle", "loss_residual", "bit_acc_img", "bit_acc_latent",
+        "loss_cycle", "loss_residual", "loss_wm_robust", "loss_clean_negative",
+        "loss_perceptual", "loss_frequency", "bit_acc_img", "bit_acc_latent",
         "ber_img", "ber_latent", "clean_false_positive_img",
         "clean_false_positive_latent", "learning_rate",
     ]
     tail = {k: _tail_mean(rows, k) for k in keys}
-    slopes = {k: _slope(rows, k) for k in ("loss", "loss_flow", "loss_wm_img", "loss_wm_latent")}
+    slopes = {k: _slope(rows, k) for k in ("loss", "loss_flow", "loss_wm_img", "loss_wm_latent", "loss_wm_robust")}
 
     warnings: List[str] = []
     notes: List[str] = []
