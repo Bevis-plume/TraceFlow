@@ -19,33 +19,78 @@ TraceFlow is a research codebase for **traceable generative image models under i
 
 ## Paper Figures
 
+The figures below are copied into `docs/readme_assets/` so they remain visible on GitHub even when local experiment folders are ignored.
+
+### Method Pipeline
+
 <p align="center">
-  <img src="docs/readme_assets/fig1_pipeline.png" alt="TraceFlow pipeline" width="92%">
+  <img src="docs/readme_assets/fig1_pipeline.png" alt="TraceFlow pipeline" width="920">
+</p>
+<p align="center">
+  <sub>Figure 1. TraceFlow pipeline: VAE latent encoding, patch-aligned keyed transform, DiT rectified-flow generation, inverse-key recovery, and dual-domain watermark tracing.</sub>
 </p>
 
 ### Generation Quality
 
 <p align="center">
-  <img src="docs/readme_assets/fig2_generation_samples.png" alt="Generation samples" width="82%">
+  <img src="docs/readme_assets/fig2_generation_samples.png" alt="Generation samples" width="860">
+</p>
+<p align="center">
+  <sub>Figure 2. CIFAR-32 generation samples from the baseline, keyed, and full TraceFlow settings.</sub>
 </p>
 
-### Keyed Inversion And Full TraceFlow
+### Keyed Inversion Resistance
 
 <p align="center">
-  <img src="docs/readme_assets/fig7_inversion_exp02_keyed.png" alt="Keyed inversion experiment" width="48%">
-  <img src="docs/readme_assets/fig8_inversion_exp03_full.png" alt="Full TraceFlow inversion experiment" width="48%">
+  <img src="docs/readme_assets/fig7_inversion_exp02_keyed.png" alt="Keyed inversion experiment" width="920">
+</p>
+<p align="center">
+  <sub>Figure 3. Exp02 keyed model: no-key inversion loses semantic content, while defender-side inverse-key decoding remains meaningful.</sub>
 </p>
 
-### Training, Latent Statistics, And Watermark Learning
+### Full TraceFlow Inversion And Traceability
 
 <p align="center">
-  <img src="docs/readme_assets/fig3_training_loss.png" alt="Training loss curves" width="48%">
-  <img src="docs/readme_assets/fig4_latent_stats.png" alt="Generated latent statistics" width="48%">
+  <img src="docs/readme_assets/fig8_inversion_exp03_full.png" alt="Full TraceFlow inversion experiment" width="920">
+</p>
+<p align="center">
+  <sub>Figure 4. Exp03 full TraceFlow: keyed inversion resistance plus post-watermark traceability in image and latent domains.</sub>
 </p>
 
+### Training Dynamics
+
 <p align="center">
-  <img src="docs/readme_assets/fig6_watermark_learning.png" alt="Watermark learning curve" width="48%">
-  <img src="docs/readme_assets/fig10_watermark_traceability_robustness.png" alt="Watermark traceability robustness" width="48%">
+  <img src="docs/readme_assets/fig3_training_loss.png" alt="Training loss curves" width="900">
+</p>
+<p align="center">
+  <sub>Figure 5. Rectified-flow training losses for baseline, keyed, and full TraceFlow runs.</sub>
+</p>
+
+### Latent Distribution Diagnostics
+
+<p align="center">
+  <img src="docs/readme_assets/fig4_latent_stats.png" alt="Generated latent statistics" width="900">
+</p>
+<p align="center">
+  <sub>Figure 6. Generated protected/native latent statistics and decoded image statistics across training.</sub>
+</p>
+
+### Watermark Learning
+
+<p align="center">
+  <img src="docs/readme_assets/fig6_watermark_learning.png" alt="Watermark learning curve" width="900">
+</p>
+<p align="center">
+  <sub>Figure 7. Full TraceFlow watermark detector learning curves and training phase schedule.</sub>
+</p>
+
+### Traceability And Robustness
+
+<p align="center">
+  <img src="docs/readme_assets/fig10_watermark_traceability_robustness.png" alt="Watermark traceability robustness" width="900">
+</p>
+<p align="center">
+  <sub>Figure 8. Watermark traceability after no-key inversion and robustness under common image perturbations.</sub>
 </p>
 
 ## Main Results
