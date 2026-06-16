@@ -1,224 +1,302 @@
-# TraceFlow
+# TraceFlow: Trackable Inversion-Resistant Latent Generation
 
-TraceFlow is a research codebase for traceable latent rectified-flow image generation under gradient/model inversion attacks.
+TraceFlow is a research codebase for **traceable generative image models under inversion attacks**. It combines a compact VAE latent space, a DiT-style rectified-flow generator, a patch-aligned keyed latent bottleneck, and dual-domain watermark detectors so that generated images remain usable while unauthorized latent inversion loses semantic meaning and authorized tracing remains possible.
 
-## One Config File
+<p align="center">
+  <img src="framework.png" alt="TraceFlow framework" width="92%">
+</p>
 
-The active configuration is intentionally simple:
+<p align="center">
+  <b>Keyed latent generation + dual-domain watermark tracing for CIFAR-32 experiments.</b>
+</p>
 
-```text
-configs/traceflow.yml
-```
+## Highlights
 
-Edit that one file for normal work. Change fields such as:
+- **Latent DiT generator.** A local VAE compresses CIFAR-10 images into `4 x 16 x 16` latents. A DiT-S rectified-flow model learns generation in this latent space.
+- **Patch-aligned keyed bottleneck.** The secret-key transform operates on DiT-aligned `4 x 2 x 2` latent patches instead of flattening rows, preserving generation quality while making no-key inversion semantically weak.
+- **Traceable watermarking.** Full TraceFlow jointly trains image-domain and latent-domain watermark detectors with a 32-bit message signal.
+- **Ablation-ready experiments.** The repository separates the baseline generator, keyed generator, and full keyed+watermarked TraceFlow runs.
 
-```yaml
-training:
-  num_steps: 100000
-  batch_size: 96
-  grad_accum_steps: 1
+## Paper Figures
 
-entries:
-  train_final:
-    overrides:
-      training:
-        batch_size: 48
-        grad_accum_steps: 2
-        mixed_precision: bf16
+<p align="center">
+  <img src="PAPER_FIGURES/fig1_pipeline.png" alt="TraceFlow pipeline" width="92%">
+</p>
 
-watermark:
-  alpha: 0.08
-  lambda_wm_img: 2.0
-  lambda_wm_latent: 1.0
-  lambda_residual: 0.001
+### Generation Quality
 
-data:
-  name: imagefolder
-  root: data/imagenette_woof_320/train
-model:
-  num_classes: 20
+<p align="center">
+  <img src="PAPER_FIGURES/fig2_generation_samples.png" alt="Generation samples" width="82%">
+</p>
 
-assets:
-  data_dir: data
-  weights_dir: weights
+### Keyed Inversion And Full TraceFlow
 
-experiments:
-  exp04:
-    attack_steps: 100
-```
+<p align="center">
+  <img src="PAPER_FIGURES/fig7_inversion_exp02_keyed.png" alt="Keyed inversion experiment" width="48%">
+  <img src="PAPER_FIGURES/fig8_inversion_exp03_full.png" alt="Full TraceFlow inversion experiment" width="48%">
+</p>
 
-Paper/default runs use a merged Imagenette-320 + Imagewoof-320 ImageFolder
-dataset cropped to 256x256 for fast paper pilots. CIFAR-10 is still supported
-only for smoke/debug runs, because upsampling CIFAR to 256 produces very blurry
-samples and is not a fair final showcase for DiT-style generation.
+### Training, Latent Statistics, And Watermark Learning
 
-Expected ImageFolder layout:
+<p align="center">
+  <img src="PAPER_FIGURES/fig3_training_loss.png" alt="Training loss curves" width="48%">
+  <img src="PAPER_FIGURES/fig4_latent_stats.png" alt="Generated latent statistics" width="48%">
+</p>
 
-```text
-data/imagenette_woof_320/train/
-  n01440764/*.JPEG
-  n01443537/*.JPEG
-  ...
-```
+<p align="center">
+  <img src="PAPER_FIGURES/fig6_watermark_learning.png" alt="Watermark learning curve" width="48%">
+  <img src="PAPER_FIGURES/fig10_watermark_traceability_robustness.png" alt="Watermark traceability robustness" width="48%">
+</p>
 
-Older split configs are archived under `docs/archive/` only for reference.
+## Main Results
 
-## Prepare Local Assets
+| Category | Metric | Exp01 Baseline | Exp02 Keyed | Exp03 Full TraceFlow |
+|---|---:|---:|---:|---:|
+| Generation | Training steps | 50k | 50k | 30k |
+| Generation | Flow loss | 0.9406 | 1.0233 | 1.1402 |
+| Autoencoder | PSNR / SSIM | 39.5 / 0.993 | shared | shared |
+| Inversion | No-key GML | - | 12.6 | 46.1 |
+| Inversion | No-key PSNR / SSIM | - | 9.6 / 0.127 | 9.4 / 0.126 |
+| Inversion | Defender PSNR / SSIM | - | 18.8 / 0.731 | 12.5 / 0.407 |
+| Watermark | Raw no-key image bit acc | n/a | n/a | 0.5078 |
+| Watermark | Post-WM image bit acc | n/a | n/a | 0.6875 |
+| Watermark | Post-WM latent bit acc | n/a | n/a | 0.7031 |
 
-To make the server run boring in the good way, pre-download the small paper
-datasets and metric weights into project-local folders before packaging:
+The full metrics table and exported plotting data are in [`PAPER_FIGURES/metrics_summary.md`](PAPER_FIGURES/metrics_summary.md) and [`PAPER_FIGURES/metrics_summary.csv`](PAPER_FIGURES/metrics_summary.csv).
 
-```bash
-python -B -m scripts.traceflow prepare-assets --config configs/traceflow.yml
-```
+## Method Overview
 
-This creates/checks:
+### 1. Local VAE Latent Space
+
+TraceFlow first trains a project-native VAE on CIFAR-10 at `32 x 32` resolution. The VAE maps each image `x` to a compact latent tensor `z` with shape `4 x 16 x 16`.
+
+The VAE is trained with reconstruction loss plus KL regularization:
 
 ```text
-data/imagenette2-320/train/
-data/imagewoof2-320/train/
-data/imagenette_woof_320/train/  # merged ImageFolder used by training
-weights/torch/          # Inception/FID/KID cache used by torchmetrics
-weights/huggingface/    # optional model/cache home
-pretrained/sd-vae-ft-mse/
+z = mu + exp(0.5 * logvar) * eps
+L_ae = L_recon(x_hat, x) + beta * KL(q(z|x) || N(0, I))
 ```
 
-The Imagenette and Imagewoof archives are each only a few hundred MB. The merged
-folder is built with hardlinks by default, so it should not duplicate image data
-on normal filesystems. LPIPS/Inception/FID weights are also well below 1 GB in
-normal setups, and keeping them in `weights/` avoids surprise downloads on the
-server. If optional metric packages are missing locally, `prepare-assets`
-records a warning; the same command can be rerun after `pip install -r
-requirements.txt`.
+For downstream generator training, the encoder uses deterministic `mu` latents and stores per-channel latent statistics for stable normalized decoding.
 
-## Final Server Commands
+### 2. DiT Rectified-Flow Generator
 
-TraceFlow's recommended server path is one command: `run-all`. It reads
-`configs/traceflow.yml`, writes one downloadable artifact bundle, trains only the
-necessary checkpoints, reuses those checkpoints for exp01-exp05, then generates
-training dashboards, paper figures, metrics, and readiness reports.
+The generator is a DiT-S style transformer operating on latent patches. With `latent_size=16` and `patch_size=2`, each latent is represented as `8 x 8 = 64` tokens.
 
-Check everything before a formal server run:
-
-```bash
-python -B -m scripts.traceflow check-ready \
-  --config configs/traceflow.yml \
-  --bundle-dir /root/autodl-tmp/traceflow_runs/preflight_pro6000
-```
-
-Run the complete RTX PRO 6000 paper pipeline:
-
-```bash
-python -B -m scripts.traceflow run-all \
-  --config configs/traceflow.yml \
-  --bundle-dir /root/autodl-tmp/traceflow_runs/paper_pro6000_imagenettewoof256 \
-  --detach
-```
-
-`run-all` performs:
+TraceFlow uses the rectified-flow convention:
 
 ```text
-Stage 0: dataset/VAE diagnosis -> reports/data_diagnosis/
-Stage 1: train/reuse generator, keyed, identity, and full TraceFlow checkpoints
-Stage 2: run exp01-exp05 with train_policy=never, reusing those checkpoints
-Stage 3: generate training figures, paper figures, readiness, and manifest files
+z_t = (1 - t) * z_data + t * eps
+v*  = eps - z_data
+L_flow = ||v_theta(z_t, t, y) - v*||^2
 ```
 
-The final bundle contains the files you download for the paper:
+Sampling starts from Gaussian noise at `t=1` and integrates the predicted velocity backward to `t=0`. Classifier-free guidance is used during sampling.
+
+### 3. Patch-Aligned Keyed Bottleneck
+
+The keyed transform is the core protection layer for inversion resistance. Instead of applying a secret transform over flattened latent rows, TraceFlow applies key-derived orthogonal transforms over DiT-aligned latent patches:
 
 ```text
-/root/autodl-tmp/traceflow_runs/paper_pro6000_imagenettewoof256/
-  configs/
-  logs/
-  outputs/
-  checkpoints/
-    generator/latest.pt
-    keyed/latest.pt
-    identity/latest.pt
-    traceflow/latest.pt
-  results/exp01 ... results/exp05
-  figures/training/
-  figures/paper/
-  reports/checkpoint_manifest.json
-  reports/readiness_report.md
-  reports/manifest.json
+latent patch block = C x p x p = 4 x 2 x 2 = 16 dimensions
+z_keyed = Q_key * z_patch + b_key
+z_native = Q_key^-1 * (z_keyed - b_key)
 ```
 
-Watch a detached run:
+This preserves the generator's spatial token structure while preventing no-key inversion from recovering semantic latents. Authorized decoding applies the inverse key before VAE decoding.
 
-```bash
-tail -f /root/autodl-tmp/traceflow_runs/paper_pro6000_imagenettewoof256/logs/main.log
-```
+### 4. Dual-Domain Watermarking
 
-Force all four model stages to retrain instead of reusing existing checkpoints:
+The full TraceFlow experiment adds a watermark adapter and two detectors:
 
-```bash
-python -B -m scripts.traceflow run-all \
-  --config configs/traceflow.yml \
-  --bundle-dir /root/autodl-tmp/traceflow_runs/paper_pro6000_imagenettewoof256 \
-  --force-train \
-  --detach
-```
+- **Image-domain detector:** traces watermark bits from decoded images.
+- **Latent-domain detector:** traces watermark bits from protected or recovered latents.
 
-For a faster probe, keep the same one-command pipeline and lower the step
-budget:
-
-```bash
-python -B -m scripts.traceflow run-all \
-  --config configs/traceflow.yml \
-  --bundle-dir /root/autodl-tmp/traceflow_runs/paper_pro6000_imagenettewoof256_probe \
-  --set training.num_steps=20000 \
-  --detach
-```
-
-Advanced/debug entries (`train-generator`, `train-keyed`, `train-identity`,
-`train-final`, and `eval-all`) remain available for staged debugging, but the
-formal paper workflow should use `run-all`.
-
-## Active Experiments
-
-| ID | Purpose |
-|---|---|
-| exp01 | generation baseline |
-| exp02 | keyed latent semantic failure |
-| exp03 | TraceFlow identity ablation |
-| exp04 | full TraceFlow inversion |
-| exp05 | robustness under transforms |
-
-## Visualisation
-
-Training dashboards are generated automatically into each bundle:
+The full objective combines generation quality, watermark accuracy, and preservation terms:
 
 ```text
-<bundle>/figures/training/
-<bundle>/reports/training_summary.md
-<bundle>/reports/loss_diagnosis.md
+L = L_flow
+  + lambda_wm_img    * L_bits_img
+  + lambda_wm_latent * L_bits_latent
+  + lambda_img       * L_image_preserve
+  + lambda_cycle     * L_cycle
+  + lambda_residual  * L_residual
+  + lambda_perc      * L_perceptual
+  + lambda_freq      * L_frequency
 ```
 
-When sample checkpoints are produced, training figures also include:
+The current CIFAR-32 full run demonstrates traceability, but the 30k watermarked model can show visible watermark artifacts. This is reported as a limitation; a frequency-domain or DWT embedding variant is a natural next step.
+
+## Experiment Map
+
+| Experiment | Purpose | Default entry |
+|---|---|---|
+| Exp01 Baseline | Pure latent generator | `train-generator` |
+| Exp02 Keyed | Secret-key generation and no-key inversion failure | `train-keyed` |
+| Exp03 Full TraceFlow | Keyed generation plus image/latent watermark tracing | `train-final` |
+
+## Repository Layout
 
 ```text
-<bundle>/figures/training/latent_trajectory_3d.png
-<bundle>/figures/training/latent_trajectory_3d.pdf
+configs/traceflow_cifar32.yml       CIFAR-32 paper configuration
+src/models/flow_transformer.py      DiT-style latent transformer
+src/generation/rectified_flow.py    Rectified-flow losses and samplers
+src/security/keyed_bottleneck.py    Flat and patch-aligned keyed transforms
+scripts/traceflow.py                Single-entry experiment runner
+scripts/train_flow_transformer.py   Generator/keyed/full training loop
+scripts/pretrain_autoencoder.py     Local VAE pretraining
+PAPER_FIGURES/                      Paper-ready figures and summary tables
 ```
 
-This is a PCA 3D projection of the reverse-flow latent trajectory from the
-initial noise point toward the generated sample.
-
-Paper-level figures include `fig1_pipeline` through `fig6_training_dashboard`, plus `summary.csv` and `summary.md`.
-
-## Quick Checks
+## Setup
 
 ```bash
-python -B -m scripts.test_keyed_bottleneck
-python -B -m scripts.test_traceflow_grad_paths
-python -B -m scripts.test_traceflow_watermarking
-python -B -m scripts.test_data_loading
-python -B -m scripts.traceflow check-ready --bundle-dir /tmp/traceflow_preflight --set project.device=auto
-python -B -m scripts.traceflow train-generator --dry-run --smoke --bundle-dir /tmp/traceflow_train_generator_check --set project.device=auto
-python -B -m scripts.traceflow train-keyed --dry-run --smoke --bundle-dir /tmp/traceflow_train_keyed_check --set project.device=auto
-python -B -m scripts.traceflow train-identity --dry-run --smoke --bundle-dir /tmp/traceflow_train_identity_check --set project.device=auto
-python -B -m scripts.traceflow train-final --dry-run --smoke --bundle-dir /tmp/traceflow_train_final_check --set project.device=auto
-python -B -m scripts.traceflow run-all --dry-run --smoke --bundle-dir /tmp/traceflow_run_all_check --set project.device=auto
-python -B -m scripts.traceflow eval-all --dry-run --smoke --bundle-dir /tmp/traceflow_eval_all_check --generator-checkpoint /tmp/fake_generator.pt --keyed-checkpoint /tmp/fake_keyed.pt --identity-checkpoint /tmp/fake_identity.pt --traceflow-checkpoint /tmp/fake_traceflow.pt --set project.device=auto
+git clone <your-repo-url> TraceFlow
+cd TraceFlow
+
+conda create -n traceflow-cuda python=3.11 -y
+conda activate traceflow-cuda
+pip install -r requirements.txt
+```
+
+The current paper configuration targets a single CUDA GPU and native CIFAR-10 download through torchvision.
+
+## Quickstart
+
+### 1. Train the local VAE
+
+```bash
+AE_BUNDLE=runs/cifar32_vae_ae
+
+python -m scripts.traceflow train-autoencoder \
+  --config configs/traceflow_cifar32.yml \
+  --bundle-dir "$AE_BUNDLE" \
+  --foreground
+```
+
+After training, use:
+
+```bash
+AE="$AE_BUNDLE/checkpoints/autoencoder/latest.pt"
+```
+
+### 2. Exp01: train the baseline generator
+
+```bash
+GEN_BUNDLE=runs/exp01_baseline_50k
+
+python -m scripts.traceflow train-generator \
+  --config configs/traceflow_cifar32.yml \
+  --bundle-dir "$GEN_BUNDLE" \
+  --set autoencoder.checkpoint_path="$AE" \
+  --set training.num_steps=50000 \
+  --foreground
+```
+
+### 3. Exp02: train the keyed generator
+
+```bash
+KEYED_BUNDLE=runs/exp02_keyed_patch_50k
+
+python -m scripts.traceflow train-keyed \
+  --config configs/traceflow_cifar32.yml \
+  --bundle-dir "$KEYED_BUNDLE" \
+  --set autoencoder.checkpoint_path="$AE" \
+  --set security.latent_transform.block_layout=patch \
+  --set training.num_steps=50000 \
+  --foreground
+```
+
+### 4. Exp03: train full TraceFlow
+
+```bash
+FULL_BUNDLE=runs/exp03_full_traceflow_30k
+KEYED_CKPT="$KEYED_BUNDLE/checkpoints/traceflow-cifar32_lat16_vae-keyed/latest.pt"
+
+python -m scripts.traceflow train-final \
+  --config configs/traceflow_cifar32.yml \
+  --bundle-dir "$FULL_BUNDLE" \
+  --set autoencoder.checkpoint_path="$AE" \
+  --set watermark.lambda_wm_latent=0.5 \
+  --set training.num_steps=30000 \
+  --init-from "$KEYED_CKPT" \
+  --foreground
+```
+
+## Sampling
+
+```bash
+python -m scripts.sample_flow_transformer \
+  --config configs/traceflow_cifar32.yml \
+  --checkpoint "$GEN_BUNDLE/checkpoints/traceflow-cifar32_lat16_vae-generator/latest.pt" \
+  --num-samples 16 \
+  --steps 100 \
+  --guidance-scale 3.0 \
+  --output-dir runs/samples_exp01
+```
+
+For keyed models, use the keyed checkpoint and the same config so the transform metadata matches the model.
+
+## Inversion And Traceability Evaluation
+
+Use the inversion evaluation scripts to verify the two central security claims:
+
+1. **Exp02 keyed:** no-key inversion should lose semantic meaning, while defender-side inverse-key recovery remains meaningful.
+2. **Exp03 full:** inversion remains semantically weak without the key, while watermark bits remain traceable in image and latent domains.
+
+Example:
+
+```bash
+python -m scripts.eval_traceflow_inversion \
+  --config configs/traceflow_cifar32.yml \
+  --checkpoint "$KEYED_BUNDLE/checkpoints/traceflow-cifar32_lat16_vae-keyed/latest.pt" \
+  --output-dir runs/inversion_exp02_keyed
+```
+
+Generated inversion summaries can be visualized with the plotting scripts used to produce [`PAPER_FIGURES/`](PAPER_FIGURES/).
+
+## Reproducing The Paper Figures
+
+The exported figures used in the current paper draft are stored in [`PAPER_FIGURES/`](PAPER_FIGURES/). They include PNG and PDF versions for GitHub preview and manuscript inclusion.
+
+```text
+fig1_pipeline                         method overview
+fig2_generation_samples               baseline/keyed/full generation samples
+fig3_training_loss                    training loss curves
+fig4_latent_stats                     latent distribution diagnostics
+fig5_autoencoder                      VAE reconstruction and prior diagnostics
+fig6_watermark_learning               full TraceFlow watermark learning curve
+fig7_inversion_exp02_keyed             keyed inversion visual results
+fig8_inversion_exp03_full              full TraceFlow inversion visual results
+fig9_inversion_quality_bars            inversion metric comparison
+fig10_watermark_traceability_robustness watermark traceability metrics
+```
+
+## Lessons From Debugging
+
+Several issues were resolved during development and are reflected in the current code:
+
+- Deterministic AE latents alone were not enough; VAE posterior sampling and latent statistics were needed for stable generator training.
+- Raw `decode(N(0,I))` was not the right diagnostic path; flow-normalized prior decoding must use stored latent statistics.
+- DiT timestep embeddings require timestep-like scale, so `time_scale=1000.0` is used.
+- A mixed-high rectified-flow objective improved some probes but hurt full sampling, so the final CIFAR-32 runs use uniform `t`.
+- The original flat keyed transform scrambled latent rows and produced color-noise samples. The current patch-aligned keyed transform fixes this by matching the DiT patch layout.
+
+## Limitations
+
+- Current released results are CIFAR-10 at `32 x 32`; larger-image experiments require retuning model size, VAE, and watermark strength.
+- The 30k full TraceFlow watermark run shows visible artifacts. Future work should explore frequency-domain or DWT-style embedding for better invisibility.
+- Quantitative perceptual metrics should be extended with larger sample counts before making strong claims about generation quality.
+
+## Citation
+
+If you use this codebase or figures, please cite the project once the paper metadata is finalized:
+
+```bibtex
+@misc{traceflow2026,
+  title        = {TraceFlow: Trackable Inversion-Resistant Latent Generation},
+  author       = {Anonymous},
+  year         = {2026},
+  howpublished = {GitHub repository}
+}
 ```
