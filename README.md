@@ -3,7 +3,7 @@
 TraceFlow is a research codebase for **traceable generative image models under inversion attacks**. It combines a compact VAE latent space, a DiT-style rectified-flow generator, a patch-aligned keyed latent bottleneck, and dual-domain watermark detectors so that generated images remain usable while unauthorized latent inversion loses semantic meaning and authorized tracing remains possible.
 
 <p align="center">
-  <img src="framework.png" alt="TraceFlow framework" width="92%">
+  <img src="docs/readme_assets/framework.png" alt="TraceFlow framework" width="92%">
 </p>
 
 <p align="center">
@@ -20,32 +20,32 @@ TraceFlow is a research codebase for **traceable generative image models under i
 ## Paper Figures
 
 <p align="center">
-  <img src="PAPER_FIGURES/fig1_pipeline.png" alt="TraceFlow pipeline" width="92%">
+  <img src="docs/readme_assets/fig1_pipeline.png" alt="TraceFlow pipeline" width="92%">
 </p>
 
 ### Generation Quality
 
 <p align="center">
-  <img src="PAPER_FIGURES/fig2_generation_samples.png" alt="Generation samples" width="82%">
+  <img src="docs/readme_assets/fig2_generation_samples.png" alt="Generation samples" width="82%">
 </p>
 
 ### Keyed Inversion And Full TraceFlow
 
 <p align="center">
-  <img src="PAPER_FIGURES/fig7_inversion_exp02_keyed.png" alt="Keyed inversion experiment" width="48%">
-  <img src="PAPER_FIGURES/fig8_inversion_exp03_full.png" alt="Full TraceFlow inversion experiment" width="48%">
+  <img src="docs/readme_assets/fig7_inversion_exp02_keyed.png" alt="Keyed inversion experiment" width="48%">
+  <img src="docs/readme_assets/fig8_inversion_exp03_full.png" alt="Full TraceFlow inversion experiment" width="48%">
 </p>
 
 ### Training, Latent Statistics, And Watermark Learning
 
 <p align="center">
-  <img src="PAPER_FIGURES/fig3_training_loss.png" alt="Training loss curves" width="48%">
-  <img src="PAPER_FIGURES/fig4_latent_stats.png" alt="Generated latent statistics" width="48%">
+  <img src="docs/readme_assets/fig3_training_loss.png" alt="Training loss curves" width="48%">
+  <img src="docs/readme_assets/fig4_latent_stats.png" alt="Generated latent statistics" width="48%">
 </p>
 
 <p align="center">
-  <img src="PAPER_FIGURES/fig6_watermark_learning.png" alt="Watermark learning curve" width="48%">
-  <img src="PAPER_FIGURES/fig10_watermark_traceability_robustness.png" alt="Watermark traceability robustness" width="48%">
+  <img src="docs/readme_assets/fig6_watermark_learning.png" alt="Watermark learning curve" width="48%">
+  <img src="docs/readme_assets/fig10_watermark_traceability_robustness.png" alt="Watermark traceability robustness" width="48%">
 </p>
 
 ## Main Results
@@ -62,7 +62,7 @@ TraceFlow is a research codebase for **traceable generative image models under i
 | Watermark | Post-WM image bit acc | n/a | n/a | 0.6875 |
 | Watermark | Post-WM latent bit acc | n/a | n/a | 0.7031 |
 
-The full metrics table and exported plotting data are in [`PAPER_FIGURES/metrics_summary.md`](PAPER_FIGURES/metrics_summary.md) and [`PAPER_FIGURES/metrics_summary.csv`](PAPER_FIGURES/metrics_summary.csv).
+The full metrics table and exported plotting data are in [`docs/readme_assets/metrics_summary.md`](docs/readme_assets/metrics_summary.md) and [`docs/readme_assets/metrics_summary.csv`](docs/readme_assets/metrics_summary.csv).
 
 ## Method Overview
 
@@ -253,11 +253,11 @@ python -m scripts.eval_traceflow_inversion \
   --output-dir runs/inversion_exp02_keyed
 ```
 
-Generated inversion summaries can be visualized with the plotting scripts used to produce [`PAPER_FIGURES/`](PAPER_FIGURES/).
+Generated inversion summaries can be visualized with the plotting scripts used to produce the paper figures. README-ready figure copies are stored in [`docs/readme_assets/`](docs/readme_assets/).
 
 ## Reproducing The Paper Figures
 
-The exported figures used in the current paper draft are stored in [`PAPER_FIGURES/`](PAPER_FIGURES/). They include PNG and PDF versions for GitHub preview and manuscript inclusion.
+The README-visible figure copies are stored in [`docs/readme_assets/`](docs/readme_assets/). Full local plotting exports may additionally be written to `PAPER_FIGURES/`, which is ignored by git.
 
 ```text
 fig1_pipeline                         method overview
