@@ -92,9 +92,10 @@ class PatchEmbed(nn.Module):
 class TimestepEmbedder(nn.Module):
     """Embeds scalar timesteps t in [0,1] into dense vectors."""
 
-    def __init__(self, hidden_size: int, freq_dim: int = 256) -> None:
+    def __init__(self, hidden_size: int, freq_dim: int = 256, time_scale: float = 1.0) -> None:
         super().__init__()
         self.freq_dim = freq_dim
+        self.time_scale = float(time_scale)
         self.mlp = nn.Sequential(
             nn.Linear(freq_dim, hidden_size),
             nn.SiLU(),
@@ -121,7 +122,11 @@ class TimestepEmbedder(nn.Module):
         return emb
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
-        freq = self._sinusoidal(t, self.freq_dim)
+        # Diffusion/DiT sinusoidal embeddings expect timestep-like magnitudes
+        # rather than tiny [0, 1] phases. Scaling continuous flow time restores
+        # meaningful frequency variation while keeping the solver convention
+        # t=0 clean, t=1 noise unchanged.
+        freq = self._sinusoidal(t * self.time_scale, self.freq_dim)
         return self.mlp(freq)
 
 
@@ -327,6 +332,7 @@ class FlowTransformer(nn.Module):
         dropout: float = 0.0,
         class_conditional: bool = False,
         num_classes: Optional[int] = None,
+        time_scale: float = 1.0,
     ) -> None:
         super().__init__()
         self.latent_channels = latent_channels
@@ -348,6 +354,7 @@ class FlowTransformer(nn.Module):
             dropout=dropout,
             class_conditional=class_conditional,
             num_classes=num_classes,
+            time_scale=float(time_scale),
         )
 
         # Patch embedding
@@ -360,7 +367,7 @@ class FlowTransformer(nn.Module):
         self.register_buffer("pos_embed", torch.from_numpy(pos_emb).float().unsqueeze(0))
 
         # Timestep embedding
-        self.t_embedder = TimestepEmbedder(hidden_size)
+        self.t_embedder = TimestepEmbedder(hidden_size, time_scale=time_scale)
 
         # Optional class embedding
         self.y_embedder: Optional[LabelEmbedder] = None
@@ -480,6 +487,7 @@ def build_flow_transformer(
     dropout: float = 0.0,
     class_conditional: bool = False,
     num_classes: Optional[int] = None,
+    time_scale: float = 1.0,
     **kwargs,
 ) -> FlowTransformer:
     """Build a FlowTransformer from a preset name or explicit kwargs."""
@@ -494,6 +502,7 @@ def build_flow_transformer(
         dropout=dropout,
         class_conditional=class_conditional,
         num_classes=num_classes,
+        time_scale=float(time_scale),
     )
     if preset is not None:
         if preset not in PRESETS:

@@ -90,6 +90,8 @@ ROBUSTNESS_TRANSFORMS = [
     "crop_resize",
 ]
 
+CURRENT_BUNDLE_DIR: Optional[Path] = None
+
 
 # ---------------------------------------------------------------------------
 # Data discovery
@@ -101,6 +103,29 @@ def _load_json(path: Path) -> Dict[str, Any]:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
+
+
+def _resolve_existing_path(path_like: Any) -> Optional[Path]:
+    if not path_like:
+        return None
+    raw = Path(str(path_like))
+    if raw.exists():
+        return raw
+    candidates: List[Path] = []
+    if CURRENT_BUNDLE_DIR is not None:
+        parts = raw.parts
+        if "traceflow_runs" in parts:
+            idx = parts.index("traceflow_runs")
+            if len(parts) > idx + 2:
+                candidates.append(CURRENT_BUNDLE_DIR.joinpath(*parts[idx + 2:]))
+        if not raw.is_absolute():
+            candidates.append(CURRENT_BUNDLE_DIR / raw)
+    if not raw.is_absolute():
+        candidates.append(raw)
+    for cand in candidates:
+        if cand.exists():
+            return cand
+    return None
 
 
 def discover_experiments(results_dir: Path, mode: str) -> Dict[str, Dict[str, Any]]:
@@ -134,7 +159,7 @@ def discover_experiments(results_dir: Path, mode: str) -> Dict[str, Dict[str, An
 
         metrics = _load_json(chosen / "metrics.json")
         inversion = {}
-        for inv_name in ("inversion", "inversion_latent"):
+        for inv_name in ("strong_inversion_geiping", "inversion", "inversion_latent"):
             inv_path = chosen / inv_name / "metrics.json"
             if inv_path.exists():
                 inversion = _load_json(inv_path)
@@ -151,16 +176,47 @@ def discover_experiments(results_dir: Path, mode: str) -> Dict[str, Dict[str, An
 
 def _train_log_path(metrics: Dict[str, Any]) -> Optional[Path]:
     """Resolve the train_log.jsonl path for an experiment from its metrics."""
-    out_dir = metrics.get("output_dir")
-    if out_dir:
-        p = Path(out_dir) / "train_log.jsonl"
-        if p.exists():
-            return p
-    run_name = metrics.get("run_name")
+    out_dir = _resolve_existing_path(metrics.get("output_dir"))
+    if out_dir is not None:
+        for p in sorted(out_dir.glob("train_log*.jsonl")):
+            if p.exists():
+                return p
+    run_name = str(metrics.get("run_name") or "")
+    candidate_names: List[str] = []
     if run_name:
-        p = Path("outputs/flow_transformer") / run_name / "train_log.jsonl"
-        if p.exists():
-            return p
+        candidate_names.append(run_name)
+        replacements = {
+            "-exp01-baseline": "-generator",
+            "-exp02-keyed": "-keyed",
+            "-exp03-identity": "-identity",
+            "-exp04-traceflow": "-final",
+            "-exp05-robustness": "-final",
+        }
+        for src, dst in replacements.items():
+            if src in run_name:
+                candidate_names.append(run_name.replace(src, dst))
+    checkpoint = str(metrics.get("checkpoint") or "")
+    if checkpoint:
+        parts = Path(checkpoint).parts
+        if "checkpoints" in parts:
+            idx = parts.index("checkpoints")
+            if len(parts) > idx + 1:
+                candidate_names.append(parts[idx + 1])
+    for name in candidate_names:
+        candidates: List[Path] = []
+        if CURRENT_BUNDLE_DIR is not None:
+            candidates.append(CURRENT_BUNDLE_DIR / "outputs" / name)
+        candidates.extend([
+            Path("outputs/flow_transformer_cifar32_lat16_vae") / name,
+            Path("outputs/flow_transformer_cifar32_lat16") / name,
+            Path("outputs/flow_transformer_cifar32") / name,
+            Path("outputs/flow_transformer") / name,
+            Path("outputs") / name,
+        ])
+        for run_dir in candidates:
+            for p in sorted(run_dir.glob("train_log*.jsonl")):
+                if p.exists():
+                    return p
     return None
 
 
@@ -329,7 +385,7 @@ def fig_attack_grid(
         info = experiments.get(exp_id)
         if not info:
             continue
-        for inv_name in ("inversion", "inversion_latent"):
+        for inv_name in ("strong_inversion_geiping", "inversion", "inversion_latent"):
             cand = info["dir"] / inv_name / "images"
             if cand.exists():
                 img_dir, chosen_exp = cand, exp_id
@@ -800,7 +856,9 @@ def fig_training_dashboard(experiments: Dict[str, Dict[str, Any]], out_stem: Pat
 # ---------------------------------------------------------------------------
 
 def main(args: argparse.Namespace) -> int:
+    global CURRENT_BUNDLE_DIR
     results_dir = Path(args.results_dir)
+    CURRENT_BUNDLE_DIR = results_dir.parent if results_dir.name == "results" else None
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 

@@ -5,6 +5,8 @@
 /weights/
 /results/
 /attack_outputs/
+/runs/
+/PAPER_CIFAR32_RESULTS/
 wandb/
 hf_cache/
 .codegraph/

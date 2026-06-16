@@ -44,7 +44,7 @@ from src.utils.config_composer import (
 )
 
 EXP_ORDER = ["exp01", "exp02", "exp03", "exp04", "exp05"]
-BASE_SECTIONS = ["naming", "assets", "hardware", "project", "data", "autoencoder", "model", "training", "sampling", "smoke", "security", "watermark"]
+BASE_SECTIONS = ["naming", "assets", "hardware", "project", "data", "autoencoder", "model", "training", "flow_matching", "sampling", "smoke", "security", "watermark"]
 DEFAULT_CONFIG = "configs/traceflow.yml"
 
 
@@ -104,6 +104,14 @@ def _write_resolved_config(resolved: Dict[str, Any], dest: Path) -> Path:
 
 def _base_config(raw: Mapping[str, Any]) -> Dict[str, Any]:
     return {k: deepcopy(raw[k]) for k in BASE_SECTIONS if k in raw}
+
+
+def _assert_flow_matching_preserved(raw: Mapping[str, Any], resolved: Mapping[str, Any]) -> None:
+    if raw.get("flow_matching") and not resolved.get("flow_matching"):
+        raise RuntimeError(
+            "flow_matching was present in the source config but missing from the "
+            "resolved training config. Add it to BASE_SECTIONS before launching training."
+        )
 
 
 def _set_project(config: Dict[str, Any], *, name: str | None = None, output_root: str | None = None, checkpoint_root: str | None = None) -> None:
@@ -420,6 +428,7 @@ def _single_train_config(raw: Mapping[str, Any], overrides: List[str]) -> tuple[
     meta = raw.get("traceflow", {})
     _set_project(resolved, name=_format_name_template(raw, meta.get("run_name") or meta.get("name") or "{project}-{dataset}-{budget}"))
     resolved = apply_overrides(resolved, overrides)
+    _assert_flow_matching_preserved(raw, resolved)
     validate_resolved_config(resolved)
     return resolved, {"run": {"name": resolved.get("project", {}).get("name")}, "postprocess": raw.get("postprocess", {})}
 
@@ -435,6 +444,7 @@ def _single_experiment_config(raw: Mapping[str, Any], exp_id: str, overrides: Li
     if exp.get("overrides"):
         resolved = deep_merge(resolved, exp["overrides"])
     resolved = apply_overrides(resolved, overrides)
+    _assert_flow_matching_preserved(raw, resolved)
     validate_resolved_config(resolved)
     return resolved, {
         "exp_id": exp_id,
@@ -459,6 +469,7 @@ def _final_entry_config(raw: Mapping[str, Any], *, method: str, run_name: str, e
     _point_config_at_bundle(resolved, paths)
     resolved = apply_overrides(resolved, overrides)
     _point_config_at_bundle(resolved, paths)
+    _assert_flow_matching_preserved(raw, resolved)
     validate_resolved_config(resolved)
     return resolved
 
@@ -528,6 +539,8 @@ def _train_final_entry(args: argparse.Namespace, *, entry: str, method: str, fal
         cmd.append("--smoke")
     if args.resume:
         cmd.extend(["--resume", args.resume])
+    elif getattr(args, "init_from", None):
+        cmd.extend(["--init-from", args.init_from])
     rc = _run(cmd, dry_run=args.dry_run, log_path=paths["logs"] / "train.log")
     if rc != 0:
         _write_manifest(paths, command=entry, run_name=run_name, status="error")
@@ -563,34 +576,226 @@ def _train_final(args: argparse.Namespace) -> int:
     return _train_final_entry(args, entry="train_final", method="traceflow", fallback_run_name="traceflow-final")
 
 
+def _ae_checkpoint_path(raw: Mapping[str, Any]) -> Path:
+    """Resolve the shared local-AE checkpoint path (project-relative)."""
+    configured = (raw.get("autoencoder", {}) or {}).get("checkpoint_path")
+    if configured:
+        return Path(configured)
+    dataset = str((raw.get("naming", {}) or {}).get("dataset_tag", "local"))
+    return Path("checkpoints") / f"{dataset}_ae" / "latest.pt"
+
+
+def _train_autoencoder(args: argparse.Namespace) -> int:
+    """Pretrain the local autoencoder before any TraceFlow training.
+
+    Writes the AE checkpoint to the shared ``autoencoder.checkpoint_path`` so the
+    generator / keyed / identity / full TraceFlow runs all load (and freeze) the
+    exact AE diagnosed here. Reconstruction grid + metrics land in the bundle.
+    """
+    raw = apply_overrides(load_yaml(args.config), getattr(args, "set_overrides", []))
+    entry = "train_autoencoder"
+    run_name = _entry_run_name(raw, entry, "traceflow-autoencoder")
+    bundle = _bundle_root(raw, entry, run_name, args.bundle_dir)
+    paths = _ensure_bundle(bundle)
+    _write_readme(paths, title="TraceFlow autoencoder pretraining bundle")
+    ae_ckpt = _ae_checkpoint_path(raw)
+    output_dir = paths["outputs"] / run_name
+    print(f"[traceflow] entry:      {entry}")
+    print(f"[traceflow] bundle:     {paths['root']}")
+    print(f"[traceflow] ae ckpt:    {ae_ckpt}")
+    cmd = [
+        *_python_module_cmd("scripts.pretrain_autoencoder"),
+        "--config", str(args.config),
+        "--run-name", run_name,
+        "--output-dir", str(output_dir),
+        "--checkpoint", str(ae_ckpt),
+    ]
+    if args.smoke:
+        cmd.append("--smoke")
+    if getattr(args, "steps", None) is not None:
+        cmd.extend(["--steps", str(args.steps)])
+    rc = _run(cmd, dry_run=args.dry_run, log_path=paths["logs"] / "train_autoencoder.log")
+    if rc != 0:
+        _write_manifest(paths, command=entry, run_name=run_name, status="error")
+        return rc
+    if not args.dry_run:
+        for name in (
+            "ae_recon_grid.png",
+            "ae_prior_grid.png",
+            "ae_prior_flow_grid.png",
+            "ae_prior_raw_grid.png",
+            "ae_posterior_grid.png",
+            "ae_metrics.json",
+        ):
+            src = output_dir / name
+            if src.exists():
+                shutil.copy2(src, paths["reports"] / name)
+    _write_manifest(paths, command=entry, run_name=run_name, status="dry_run" if args.dry_run else "ok")
+    print(f"[traceflow] autoencoder ready: {ae_ckpt}")
+    print(f"[traceflow] recon diagnostics: {paths['reports'] / 'ae_recon_grid.png'}")
+    print(f"[traceflow] flow prior diagnostics: {paths['reports'] / 'ae_prior_flow_grid.png'}")
+    print(f"[traceflow] prior diagnostics alias: {paths['reports'] / 'ae_prior_grid.png'}")
+    return 0
+
+
+def _diagnose_ae(args: argparse.Namespace) -> int:
+    """Re-run the AE reconstruction diagnostic from an existing checkpoint."""
+    raw = apply_overrides(load_yaml(args.config), getattr(args, "set_overrides", []))
+    bundle = _bundle_root(raw, "train_autoencoder", _entry_run_name(raw, "train_autoencoder", "traceflow-autoencoder"), args.bundle_dir)
+    paths = _ensure_bundle(bundle)
+    ae_ckpt = Path(args.checkpoint) if getattr(args, "checkpoint", None) else _ae_checkpoint_path(raw)
+    output_dir = paths["reports"] / "ae_diagnosis"
+    cmd = [
+        *_python_module_cmd("scripts.pretrain_autoencoder"),
+        "--config", str(args.config),
+        "--diagnose-only",
+        "--checkpoint", str(ae_ckpt),
+        "--output-dir", str(output_dir),
+    ]
+    if args.smoke:
+        cmd.append("--smoke")
+    rc = _run(cmd, dry_run=args.dry_run, log_path=paths["logs"] / "diagnose_ae.log")
+    if rc == 0:
+        print(f"[traceflow] AE diagnosis: {output_dir / 'ae_recon_grid.png'}")
+    return rc
+
+
+def _prepare_data(args: argparse.Namespace) -> int:
+    """Download/extract the configured lightweight dataset on the training server."""
+    raw = apply_overrides(load_yaml(args.config), args.set_overrides)
+    data_cfg = raw.get("data", {}) or {}
+    name = str(data_cfg.get("name", "random"))
+    root = str(data_cfg.get("root", "data"))
+    image_size = int(data_cfg.get("image_size", 32))
+    if name == "random":
+        print("[traceflow] data: random smoke data requires no download")
+        return 0
+    if name != "cifar10":
+        print(f"[traceflow] data: {name!r} is not managed by prepare-data; use prepare-assets or provide files manually")
+        return 1
+    extracted = Path(root) / "cifar-10-batches-py"
+    print(f"[traceflow] prepare-data: CIFAR-10 root={root} image_size={image_size}")
+    if args.dry_run:
+        print(f"[traceflow] [dry-run] would download/extract CIFAR-10 to {extracted}")
+        return 0
+    from src.data.image_datasets import build_dataset
+    dataset = build_dataset(
+        name="cifar10",
+        root=root,
+        image_size=image_size,
+        download=True,
+        smoke=False,
+    )
+    if not extracted.exists():
+        print(f"[traceflow] error: torchvision returned but extracted CIFAR-10 is missing: {extracted}")
+        return 1
+    print(f"[traceflow] data ready: {extracted} ({len(dataset)} train images)")
+    return 0
+
+
+def _paper_figures(args: argparse.Namespace) -> int:
+    """Generate the curated CIFAR-32 paper figures into one folder."""
+    raw = load_yaml(args.config)
+    run_name = _entry_run_name(raw, "run_all", "traceflow-paper-all")
+    bundle = _bundle_root(raw, "run_all", run_name, args.bundle_dir)
+    paths = _bundle_paths(bundle)
+    out = Path(args.output_dir) if getattr(args, "output_dir", None) else Path("PAPER_CIFAR32_RESULTS")
+    cmd = [
+        *_python_module_cmd("scripts.make_cifar_paper_figures"),
+        "--bundle-dir", str(paths["root"]),
+        "--results-dir", str(paths["results"]),
+        "--output-dir", str(out),
+        "--config", str(args.config),
+    ]
+    rc = _run(cmd, dry_run=args.dry_run)
+    if rc == 0:
+        print(f"[traceflow] paper figures: {out}")
+    return rc
+
+
+# RTX 5090 32GB advisory micro-batch ceilings per training stage. Watermarked
+# stages (identity/final) carry perceptual + dual-head detector activations and
+# need more headroom than the plain generator/keyed runs.
+_SAFE_MICRO_BATCH_5090: Dict[str, int] = {
+    "generator": 128,
+    "keyed": 128,
+    "traceflow_identity": 64,
+    "traceflow": 48,
+}
+
+
+def _entry_configured_batch(raw: Mapping[str, Any], entry: str, method: str) -> int:
+    """Resolve the configured micro-batch for a training entry (no bundle needed)."""
+    resolved = _base_config(raw)
+    _apply_method(resolved, method, raw)
+    resolved = deep_merge(resolved, _entry_overrides(raw, entry))
+    try:
+        return int(resolved.get("training", {}).get("batch_size", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _estimate_5090_batch(args: argparse.Namespace) -> int:
+    """Static, CUDA-free advisory: safe micro-batch sizes for the RTX 5090 32GB.
+
+    This is a preflight estimate (no GPU required, safe to run on the Mac). It
+    compares each training stage's configured micro-batch against a conservative
+    32GB ceiling and prints the OOM-retry ladder run-all would fall back to.
+    """
+    raw = load_yaml(args.config)
+    profile = str(raw.get("hardware", {}).get("profile", "")).lower()
+    print("[traceflow] RTX 5090 32GB micro-batch preflight (static estimate, no CUDA needed)")
+    print(f"[traceflow] hardware.profile = {profile or 'unspecified'}")
+    print(f"[traceflow] {'stage':20s} {'method':20s} {'configured':>10s} {'safe<=':>7s}  status / OOM ladder")
+    any_warn = False
+    for stage in RUN_ALL_TRAIN_STAGES:
+        key = stage["key"]
+        configured = _entry_configured_batch(raw, stage["entry"], stage["method"])
+        ceiling = _SAFE_MICRO_BATCH_5090.get(key, 48)
+        ladder = _oom_batch_ladder(configured) if configured else []
+        if configured > ceiling:
+            any_warn = True
+            verdict = f"WARN: >{ceiling}; may OOM. Fallback ladder: {ladder}"
+        else:
+            verdict = f"ok. Fallback ladder if OOM: {ladder}"
+        print(f"[traceflow] {stage['title'][:20]:20s} {stage['method']:20s} "
+              f"{configured:>10d} {ceiling:>7d}  {verdict}")
+    print("[traceflow] inversion eval runs at batch_size=1 (latent and pixel as separate "
+          "processes) — safe on 32GB.")
+    if any_warn:
+        print("[traceflow] At least one stage exceeds the 32GB ceiling; run-all --oom-retry "
+              "(default) will auto-fallback, but consider lowering the configured batch_size.")
+    return 0
+
+
 RUN_ALL_TRAIN_STAGES = [
     {
         "key": "generator",
         "entry": "train_generator",
         "method": "baseline",
         "fallback": "traceflow-generator",
-        "title": "generator baseline",
+        "title": "Baseline Generator",
     },
     {
         "key": "keyed",
         "entry": "train_keyed",
         "method": "keyed",
         "fallback": "traceflow-keyed",
-        "title": "exp02 keyed-only",
+        "title": "Keyed Latent",
     },
     {
         "key": "traceflow_identity",
         "entry": "train_identity",
         "method": "traceflow_identity",
         "fallback": "traceflow-identity",
-        "title": "exp03 TraceFlow identity",
+        "title": "TraceFlow Identity",
     },
     {
         "key": "traceflow",
         "entry": "train_final",
         "method": "traceflow",
         "fallback": "traceflow-final",
-        "title": "full TraceFlow",
+        "title": "Full TraceFlow",
     },
 ]
 
@@ -598,6 +803,10 @@ RUN_ALL_TRAIN_STAGES = [
 def _run_all_alias_checkpoint(paths: Mapping[str, Path], key: str) -> Path:
     alias = "identity" if key == "traceflow_identity" else key
     return paths["checkpoints"] / alias / "latest.pt"
+
+
+def _run_all_autoencoder_checkpoint(paths: Mapping[str, Path]) -> Path:
+    return paths["checkpoints"] / "autoencoder" / "latest.pt"
 
 
 def _run_all_canonical_checkpoint(paths: Mapping[str, Path], run_name: str) -> Path:
@@ -627,6 +836,33 @@ def _log_has_oom(log_path: Path) -> bool:
         "cublas_status_alloc_failed",
     )
     return any(needle in text for needle in needles)
+
+
+def _oom_batch_ladder(base_batch: int) -> List[int]:
+    """Descending micro-batch sizes to retry after a CUDA OOM.
+
+    Derived from the configured batch size so the first retry is close to the
+    requested value instead of collapsing straight to a tiny batch. Always ends
+    at 4 (the smallest practical micro-batch for the flow transformer on the
+    RTX 5090 32GB profile).
+    """
+    base = max(int(base_batch), 1)
+    ladder: List[int] = []
+    candidate = base
+    while candidate > 4:
+        candidate = max(candidate // 2, 4)
+        if candidate < base:
+            ladder.append(candidate)
+    if 4 not in ladder:
+        ladder.append(4)
+    # Preserve descending order and drop duplicates.
+    seen: set[int] = set()
+    unique: List[int] = []
+    for value in ladder:
+        if value not in seen:
+            seen.add(value)
+            unique.append(value)
+    return unique
 
 
 def _resolve_reusable_checkpoint(
@@ -688,11 +924,29 @@ def _train_stage_for_run_all(
     print(f"[traceflow] Stage 1: train {stage['title']} -> {run_name}")
     retry_overrides: List[Dict[str, Any]] = [{}]
     if oom_retry and key in {"traceflow", "traceflow_identity"}:
-        retry_overrides.extend([
-            {"training": {"batch_size": 12, "grad_accum_steps": 1}},
-            {"training": {"batch_size": 8, "grad_accum_steps": 1}},
-            {"training": {"batch_size": 4, "grad_accum_steps": 1}},
-        ])
+        base_resolved = _final_entry_config(
+            raw,
+            method=method,
+            run_name=run_name,
+            entry=entry,
+            overrides=args.set_overrides,
+            paths=paths,
+        )
+        base_batch = int(base_resolved.get("training", {}).get("batch_size", 48))
+        retry_overrides.extend(
+            {"training": {"batch_size": bs, "grad_accum_steps": 1}}
+            for bs in _oom_batch_ladder(base_batch)
+        )
+
+    # Warm-start full TraceFlow from the already-trained baseline generator to
+    # protect image quality (it runs earlier in RUN_ALL_TRAIN_STAGES). Skipped
+    # when resuming an explicit checkpoint.
+    init_from: Optional[Path] = None
+    if key == "traceflow" and not args.resume:
+        gen_ckpt = _run_all_alias_checkpoint(paths, "generator")
+        if gen_ckpt.exists() or args.dry_run:
+            init_from = gen_ckpt
+            print(f"[traceflow] full TraceFlow will warm-start from generator: {gen_ckpt}")
 
     attempts = []
     for attempt_idx, retry_override in enumerate(retry_overrides, start=1):
@@ -722,6 +976,8 @@ def _train_stage_for_run_all(
             cmd.append("--smoke")
         if args.resume:
             cmd.extend(["--resume", args.resume])
+        elif init_from is not None:
+            cmd.extend(["--init-from", str(init_from)])
         rc = _run(cmd, dry_run=args.dry_run, log_path=log_path)
         attempts.append({
             "attempt": attempt_idx,
@@ -1109,6 +1365,151 @@ def _count_images(root: Path, *, nested: bool) -> int:
     return sum(1 for p in iterator if p.is_file() and p.suffix.lower() in exts)
 
 
+
+
+def _latent_stats_are_valid(stats: Any) -> Tuple[bool, str]:
+    if not isinstance(stats, Mapping):
+        return False, "latent_stats missing"
+    if stats.get("enabled", True) is False:
+        return False, "latent_stats.enabled is false"
+    mean = stats.get("mean")
+    std = stats.get("std")
+    if not isinstance(mean, list) or not isinstance(std, list) or not mean or len(mean) != len(std):
+        return False, "latent_stats must contain same-length non-empty mean/std lists"
+    try:
+        import math
+        mean_f = [float(v) for v in mean]
+        std_f = [float(v) for v in std]
+    except Exception as exc:
+        return False, f"latent_stats mean/std are not numeric: {exc}"
+    if not all(math.isfinite(v) for v in mean_f + std_f):
+        return False, "latent_stats contains non-finite values"
+    if not all(v > 1.0e-8 for v in std_f):
+        return False, "latent_stats std contains zero/near-zero values"
+    avg_std = sum(std_f) / len(std_f)
+    return True, f"latent stats ok ({len(std_f)} channel(s), avg_std={avg_std:.4f})"
+
+
+def _read_local_ae_latent_stats(path: Path) -> Tuple[Optional[Any], Optional[str]]:
+    ckpt, error = _read_local_ae_checkpoint(path)
+    if error:
+        return None, error
+    if not isinstance(ckpt, Mapping):
+        return None, "checkpoint is not a mapping"
+    stats = ckpt.get("latent_stats")
+    if stats is None and isinstance(ckpt.get("metrics"), Mapping):
+        stats = ckpt["metrics"].get("latent_stats")
+    return stats, None
+
+
+def _read_local_ae_checkpoint(path: Path) -> Tuple[Optional[Mapping[str, Any]], Optional[str]]:
+    try:
+        import torch
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception as exc:
+        return None, f"could not read checkpoint: {exc}"
+    if not isinstance(ckpt, Mapping):
+        return None, "checkpoint is not a mapping"
+    return ckpt, None
+
+
+def _local_ae_checkpoint_has_latent_stats(path: Path) -> Tuple[bool, str]:
+    stats, error = _read_local_ae_latent_stats(path)
+    if error:
+        return False, error
+    return _latent_stats_are_valid(stats)
+
+
+def _local_ae_checkpoint_has_prior_diagnostics(
+    path: Path,
+    *,
+    min_prior_pixel_std: float,
+) -> Tuple[bool, str]:
+    ckpt, error = _read_local_ae_checkpoint(path)
+    if error:
+        return False, error
+    assert ckpt is not None
+    config = ckpt.get("config") if isinstance(ckpt.get("config"), Mapping) else {}
+    metrics = ckpt.get("metrics") if isinstance(ckpt.get("metrics"), Mapping) else {}
+    kind = str(config.get("kind", "deterministic")).lower()
+    if kind not in {"vae", "kl", "autoencoderkl"}:
+        return False, f"checkpoint config kind={kind!r}, expected VAE"
+    prior_std = metrics.get("prior_flow_decode_pixel_std")
+    if prior_std is None:
+        return False, "metrics.prior_flow_decode_pixel_std missing; retrain AE with flow-prior diagnostics"
+    try:
+        import math
+        prior_std_f = float(prior_std)
+    except Exception as exc:
+        return False, f"prior_flow_decode_pixel_std is not numeric: {exc}"
+    if not math.isfinite(prior_std_f):
+        return False, "prior_flow_decode_pixel_std is non-finite"
+    if prior_std_f < float(min_prior_pixel_std):
+        return False, f"flow prior decode pixel std too low ({prior_std_f:.4f} < {min_prior_pixel_std:.4f})"
+    kl = metrics.get("kl_loss")
+    raw_std = metrics.get("prior_raw_decode_pixel_std")
+    return True, (
+        "VAE flow prior diagnostics ok "
+        f"(flow_prior_pixel_std={prior_std_f:.4f}, raw_prior_pixel_std={raw_std}, "
+        f"sample_path=flow_normalized_prior, kl={kl})"
+    )
+
+
+def _check_local_autoencoder_stats(cfg: Mapping[str, Any], paths: Mapping[str, Path], checks: List[Dict[str, Any]]) -> None:
+    ae = cfg.get("autoencoder", {}) or {}
+    if str(ae.get("backend", "local")) != "local" or not bool(ae.get("require_latent_stats", False)):
+        return
+
+    bundle_ckpt = _run_all_autoencoder_checkpoint(paths)
+    configured_ckpt = _ae_checkpoint_path(cfg).expanduser()
+
+    if bundle_ckpt.exists():
+        ok, detail = _local_ae_checkpoint_has_latent_stats(bundle_ckpt)
+        status = "ok" if ok else "error"
+        _preflight_add(checks, "autoencoder.latent_stats", status, f"bundle AE {bundle_ckpt}: {detail}")
+        return
+
+    if configured_ckpt.exists():
+        ok, detail = _local_ae_checkpoint_has_latent_stats(configured_ckpt)
+        status = "ok" if ok else "warn"
+        suffix = "run-all will train a fresh bundle AE unless this path is explicitly reused"
+        _preflight_add(checks, "autoencoder.latent_stats", status, f"configured AE {configured_ckpt}: {detail}; {suffix}")
+        return
+
+    _preflight_add(
+        checks,
+        "autoencoder.latent_stats",
+        "warn",
+        f"no local AE checkpoint yet; run-all will train {bundle_ckpt} with latent stats",
+    )
+
+
+def _check_local_autoencoder_prior(cfg: Mapping[str, Any], paths: Mapping[str, Path], checks: List[Dict[str, Any]]) -> None:
+    ae = cfg.get("autoencoder", {}) or {}
+    if str(ae.get("backend", "local")) != "local" or not bool(ae.get("require_prior_diagnostics", False)):
+        return
+    bundle_ckpt = _run_all_autoencoder_checkpoint(paths)
+    configured_ckpt = _ae_checkpoint_path(cfg).expanduser()
+    min_std = float(ae.get("min_prior_decode_pixel_std", 0.02) or 0.0)
+
+    if bundle_ckpt.exists():
+        ok, detail = _local_ae_checkpoint_has_prior_diagnostics(bundle_ckpt, min_prior_pixel_std=min_std)
+        _preflight_add(checks, "autoencoder.prior", "ok" if ok else "error", f"bundle AE {bundle_ckpt}: {detail}")
+        return
+
+    if configured_ckpt.exists():
+        ok, detail = _local_ae_checkpoint_has_prior_diagnostics(configured_ckpt, min_prior_pixel_std=min_std)
+        suffix = "run-all will train a fresh bundle AE unless this path is explicitly reused"
+        _preflight_add(checks, "autoencoder.prior", "ok" if ok else "warn", f"configured AE {configured_ckpt}: {detail}; {suffix}")
+        return
+
+    _preflight_add(
+        checks,
+        "autoencoder.prior",
+        "warn",
+        f"no local AE checkpoint yet; run-all will train {bundle_ckpt} and write ae_prior_flow_grid.png",
+    )
+
 def _check_data(cfg: Mapping[str, Any], checks: List[Dict[str, Any]]) -> None:
     data = cfg.get("data", {})
     name = data.get("name", "random")
@@ -1173,7 +1574,18 @@ def _check_training_budget(cfg: Mapping[str, Any], checks: List[Dict[str, Any]],
     effective_batch = batch_size * grad_accum
     detail = f"batch_size={batch_size}, grad_accum_steps={grad_accum}, effective_batch={effective_batch}, num_steps={num_steps}"
     hardware_profile = str(cfg.get("hardware", {}).get("profile", "")).lower()
-    micro_batch_warn = 128 if "pro_6000" in hardware_profile or "96gb" in hardware_profile else 64
+    name_lower = name.lower()
+    if "5090" in hardware_profile or "32gb" in hardware_profile:
+        if "final" in name_lower:
+            micro_batch_warn = _SAFE_MICRO_BATCH_5090["traceflow"]
+        elif "identity" in name_lower:
+            micro_batch_warn = _SAFE_MICRO_BATCH_5090["traceflow_identity"]
+        elif "keyed" in name_lower:
+            micro_batch_warn = _SAFE_MICRO_BATCH_5090["keyed"]
+        else:
+            micro_batch_warn = _SAFE_MICRO_BATCH_5090["generator"]
+    else:
+        micro_batch_warn = 128 if "pro_6000" in hardware_profile or "96gb" in hardware_profile else 64
     if batch_size <= 0 or grad_accum <= 0 or num_steps <= 0:
         _preflight_add(checks, name, "error", detail + "; values must be positive")
     elif batch_size > micro_batch_warn:
@@ -1274,6 +1686,8 @@ def _check_ready(args: argparse.Namespace) -> int:
 
     _check_training_budget(effective_raw, checks, name="training.top_level")
     _check_data(effective_raw, checks)
+    _check_local_autoencoder_stats(effective_raw, paths, checks)
+    _check_local_autoencoder_prior(effective_raw, paths, checks)
     asset_cfg = _asset_cfg(effective_raw)
     weights_dir = Path(str(asset_cfg.get("weights_dir", "weights")))
     if weights_dir.exists():
@@ -1507,7 +1921,9 @@ def _run_all(args: argparse.Namespace) -> int:
         or str(run_all_cfg.get("train_policy", "missing")).lower() == "always"
     )
     oom_retry = bool(run_all_cfg.get("oom_retry", True) and not args.no_oom_retry)
-    diagnose = bool(run_all_cfg.get("diagnose_data", True) and not args.skip_diagnose)
+    # Smoke mode trains on random data, so the dataset/VAE diagnosis (which loads
+    # the full real dataset) is both meaningless and slow — skip it.
+    diagnose = bool(run_all_cfg.get("diagnose_data", True) and not args.skip_diagnose and not smoke)
 
     print(f"[traceflow] entry:       run-all")
     print(f"[traceflow] bundle:      {paths['root']}")
@@ -1523,9 +1939,86 @@ def _run_all(args: argparse.Namespace) -> int:
         "bundle": str(paths["root"]),
         "force_train": force_train,
         "oom_retry": oom_retry,
+        "autoencoder": {},
         "train_stages": {},
         "experiments": {},
     }
+
+    # Stage 0a: for CIFAR/local-AE runs, train or reuse the shared AE before
+    # any data diagnosis or generator training. Smoke mode keeps its historical
+    # random tiny path and does not write a real AE checkpoint.
+    ae_cfg = raw.get("autoencoder", {}) or {}
+    run_all_overrides = list(args.set_overrides)
+    if not smoke and str(ae_cfg.get("backend", "local")) == "local":
+        ae_ckpt = _run_all_autoencoder_checkpoint(paths)
+        ae_override = f"autoencoder.checkpoint_path={ae_ckpt}"
+        if ae_override not in run_all_overrides:
+            run_all_overrides.append(ae_override)
+        args.set_overrides = run_all_overrides
+        ae_requires_stats = bool(ae_cfg.get("require_latent_stats", False))
+        ae_requires_prior = bool(ae_cfg.get("require_prior_diagnostics", False))
+        min_prior_std = float(ae_cfg.get("min_prior_decode_pixel_std", 0.02) or 0.0)
+        ae_stats_ok = False
+        ae_stats_detail = "not checked"
+        ae_prior_ok = False
+        ae_prior_detail = "not checked"
+        if ae_ckpt.exists() and ae_requires_stats:
+            ae_stats_ok, ae_stats_detail = _local_ae_checkpoint_has_latent_stats(ae_ckpt)
+            if not ae_stats_ok:
+                print(
+                    f"\n[traceflow] Stage 0a: existing local AE lacks valid latent stats; "
+                    f"will retrain instead of reusing {ae_ckpt} ({ae_stats_detail})"
+                )
+        if ae_ckpt.exists() and ae_requires_prior:
+            ae_prior_ok, ae_prior_detail = _local_ae_checkpoint_has_prior_diagnostics(
+                ae_ckpt,
+                min_prior_pixel_std=min_prior_std,
+            )
+            if not ae_prior_ok:
+                print(
+                    f"\n[traceflow] Stage 0a: existing local AE lacks valid VAE prior diagnostics; "
+                    f"will retrain instead of reusing {ae_ckpt} ({ae_prior_detail})"
+                )
+        need_ae = (
+            force_train
+            or not ae_ckpt.exists()
+            or (ae_requires_stats and not ae_stats_ok)
+            or (ae_requires_prior and not ae_prior_ok)
+        )
+        checkpoint_manifest["autoencoder"] = {
+            "checkpoint": str(ae_ckpt),
+            "status": "pending" if need_ae else "reused",
+            "require_latent_stats": ae_requires_stats,
+            "latent_stats_valid": ae_stats_ok if ae_ckpt.exists() else None,
+            "latent_stats_detail": ae_stats_detail if ae_ckpt.exists() else "checkpoint missing",
+            "require_prior_diagnostics": ae_requires_prior,
+            "prior_diagnostics_valid": ae_prior_ok if ae_ckpt.exists() else None,
+            "prior_diagnostics_detail": ae_prior_detail if ae_ckpt.exists() else "checkpoint missing",
+        }
+        if need_ae:
+            print("\n[traceflow] Stage 0a: train shared local autoencoder")
+            ae_args = argparse.Namespace(
+                config=args.config,
+                bundle_dir=str(paths["root"]),
+                smoke=False,
+                dry_run=args.dry_run,
+                resume=None,
+                detach=False,
+                foreground=True,
+                make_archive=False,
+                set_overrides=run_all_overrides,
+                steps=None,
+            )
+            rc = _train_autoencoder(ae_args)
+            checkpoint_manifest["autoencoder"]["status"] = "dry_run" if args.dry_run else ("ok" if rc == 0 else "error")
+            _write_checkpoint_manifest(paths, checkpoint_manifest)
+            if rc != 0:
+                _write_manifest(paths, command="run_all", run_name=run_name, status="error")
+                return rc
+        else:
+            print(f"\n[traceflow] Stage 0a: reuse shared local autoencoder {ae_ckpt}")
+    else:
+        checkpoint_manifest["autoencoder"] = {"status": "not_required" if smoke else "not_local_backend"}
 
     # Stage 0: dataset/VAE diagnosis. It is intentionally advisory; a failure
     # stops the pipeline because it usually means the expensive training would
@@ -1589,6 +2082,15 @@ def _run_all(args: argparse.Namespace) -> int:
         ckpt = stage_checkpoints[ckpt_key]
         module_path = REGISTRY[exp_id]
         mod = importlib.import_module(module_path)
+        eval_cfg = resolved.get("evaluation", {}) or {}
+        attack_steps = (
+            args.attack_steps
+            if args.attack_steps is not None
+            else eval_cfg.get("attack_steps", exp_meta.get("attack_steps"))
+        )
+        if smoke and args.attack_steps is None:
+            smoke_steps = int((resolved.get("smoke", {}) or {}).get("steps", 2) or 2)
+            attack_steps = min(int(attack_steps or smoke_steps), smoke_steps)
         exp_args = argparse.Namespace(
             smoke=smoke,
             dry_run=args.dry_run,
@@ -1597,8 +2099,8 @@ def _run_all(args: argparse.Namespace) -> int:
             output_dir=str(paths["results"]),
             run_name=exp_meta["run_name"],
             attack=args.attack or exp_meta.get("attack", "latent"),
-            steps=args.attack_steps if args.attack_steps is not None else exp_meta.get("attack_steps"),
-            attack_steps=args.attack_steps if args.attack_steps is not None else exp_meta.get("attack_steps"),
+            steps=attack_steps,
+            attack_steps=attack_steps,
             attacker=args.attacker or exp_meta.get("attacker", "no_key"),
             checkpoint=str(ckpt),
             checkpoint_override=str(ckpt),
@@ -1652,6 +2154,22 @@ def _run_all(args: argparse.Namespace) -> int:
                 rc = _readiness(argparse.Namespace(results_dir=str(paths["results"]), strict=True), dry_run=False)
                 if rc != 0:
                     return rc
+
+    if str((raw.get("data", {}) or {}).get("name", "")).lower() == "cifar10":
+        curated_dir = paths["root"] / "PAPER_CIFAR32_RESULTS"
+        cmd = [
+            *_python_module_cmd("scripts.make_cifar_paper_figures"),
+            "--bundle-dir", str(paths["root"]),
+            "--results-dir", str(paths["results"]),
+            "--output-dir", str(curated_dir),
+            "--config", str(args.config),
+        ]
+        rc = _run(cmd, dry_run=args.dry_run)
+        if rc != 0:
+            print("[traceflow] warning: curated CIFAR paper figures failed; continuing")
+        else:
+            print(f"[traceflow] curated CIFAR paper figures: {curated_dir}")
+
     _write_manifest(paths, command="run_all", run_name=run_name, status="dry_run" if args.dry_run else "ok")
     _maybe_archive(paths, bool(args.make_archive or raw.get("runtime", {}).get("make_archive", False)) and not args.dry_run)
     print(f"[traceflow] complete bundle: {paths['root']}")
@@ -1837,6 +2355,11 @@ def _parse_args() -> argparse.Namespace:
     check.add_argument("--strict", action="store_true", help="Treat warnings as failures.")
     check.add_argument("--set", dest="set_overrides", action="append", default=[], help="Dotted override, e.g. data.root=/root/autodl-tmp/images")
     check.set_defaults(func=_check_ready)
+    prep_data = sub.add_parser("prepare-data", help="Download/extract the configured lightweight dataset, e.g. CIFAR-10, on the training server.")
+    prep_data.add_argument("--config", default=DEFAULT_CONFIG)
+    prep_data.add_argument("--dry-run", action="store_true")
+    prep_data.add_argument("--set", dest="set_overrides", action="append", default=[])
+    prep_data.set_defaults(func=_prepare_data)
     diag = sub.add_parser("diagnose-data", help="Generate real/reconstruction/sample grids to diagnose ImageFolder/VAE/generator quality.")
     diag.add_argument("--config", default=DEFAULT_CONFIG)
     diag.add_argument("--bundle-dir", default=None)
@@ -1867,10 +2390,27 @@ def _parse_args() -> argparse.Namespace:
     identity.set_defaults(func=_train_identity)
     final = sub.add_parser("train-final", help="Train the full TraceFlow model into one artifact bundle.")
     _add_common_entry_args(final)
+    final.add_argument("--init-from", dest="init_from", default=None,
+                       help="Warm-start the flow model + EMA from this checkpoint (e.g. the baseline generator) to protect image quality. Watermark modules stay fresh.")
     final.set_defaults(func=_train_final)
+    ae = sub.add_parser("train-autoencoder", help="Pretrain the local autoencoder and write its checkpoint + reconstruction diagnostics before TraceFlow training.")
+    _add_common_entry_args(ae)
+    ae.add_argument("--steps", type=int, default=None, help="Override AE pretraining steps.")
+    ae.set_defaults(func=_train_autoencoder)
+    diag_ae = sub.add_parser("diagnose-ae", help="Write an autoencoder reconstruction grid + metrics from an existing AE checkpoint.")
+    _add_common_entry_args(diag_ae)
+    diag_ae.add_argument("--checkpoint", default=None, help="AE checkpoint to diagnose (default autoencoder.checkpoint_path).")
+    diag_ae.set_defaults(func=_diagnose_ae)
+    paper = sub.add_parser("paper-figures", help="Generate the curated CIFAR-32 paper figures (method-named) into one folder, e.g. PAPER_CIFAR32_RESULTS/.")
+    _add_common_entry_args(paper)
+    paper.add_argument("--output-dir", default=None, help="Curated output folder (default PAPER_CIFAR32_RESULTS/).")
+    paper.set_defaults(func=_paper_figures)
+    estimate = sub.add_parser("estimate-5090", help="Static, CUDA-free preflight: estimate safe micro-batch sizes per training stage for an RTX 5090 32GB.")
+    estimate.add_argument("--config", default=DEFAULT_CONFIG, help="Config to inspect (e.g. configs/traceflow_cifar32.yml).")
+    estimate.set_defaults(func=_estimate_5090_batch)
     all_exp = sub.add_parser("run-all", help="Run exp01-exp05 and generate all paper artifacts into one bundle.")
     _add_common_entry_args(all_exp)
-    all_exp.add_argument("--attack", choices=["latent", "pixel", "both"], default=None)
+    all_exp.add_argument("--attack", choices=["latent", "pixel", "geiping_pixel", "both"], default=None)
     all_exp.add_argument("--attack-steps", type=int, default=None)
     all_exp.add_argument("--attacker", choices=["no_key", "oracle_key", "both"], default=None)
     all_exp.add_argument("--figures", action="store_true", default=True)
@@ -1888,7 +2428,7 @@ def _parse_args() -> argparse.Namespace:
     eval_all.add_argument("--keyed-checkpoint", default=None)
     eval_all.add_argument("--identity-checkpoint", default=None)
     eval_all.add_argument("--train-missing", action="store_true", help="Train only experiments whose checkpoint is missing.")
-    eval_all.add_argument("--attack", choices=["latent", "pixel", "both"], default=None)
+    eval_all.add_argument("--attack", choices=["latent", "pixel", "geiping_pixel", "both"], default=None)
     eval_all.add_argument("--attack-steps", type=int, default=None)
     eval_all.add_argument("--attacker", choices=["no_key", "oracle_key", "both"], default=None)
     eval_all.add_argument("--figures", action="store_true", default=True)
@@ -1912,7 +2452,7 @@ def _parse_args() -> argparse.Namespace:
     exp.add_argument("--dry-run", action="store_true")
     exp.add_argument("--resume", default=None)
     exp.add_argument("--output-dir", default=None)
-    exp.add_argument("--attack", choices=["latent", "pixel", "both"], default=None)
+    exp.add_argument("--attack", choices=["latent", "pixel", "geiping_pixel", "both"], default=None)
     exp.add_argument("--attack-steps", type=int, default=None)
     exp.add_argument("--attacker", choices=["no_key", "oracle_key", "both"], default=None)
     exp.add_argument("--figures", action="store_true")

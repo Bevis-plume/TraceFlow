@@ -30,6 +30,7 @@ Example config sections
       type: keyed
       secret_key: CHANGE_ME_FOR_REAL_RUNS
       block_size: 16
+      block_layout: patch
       bias_scale: 0.1
 """
 
@@ -80,6 +81,7 @@ def build_latent_transform(
             latent_channels=latent_channels,
             latent_size=latent_size,
             block_size=int(lt_cfg.get("block_size", 16)),
+            block_layout=str(lt_cfg.get("block_layout", "flat")),
             bias_scale=float(lt_cfg.get("bias_scale", 0.1)),
         )
 

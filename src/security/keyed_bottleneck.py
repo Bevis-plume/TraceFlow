@@ -38,6 +38,7 @@ checkpoint state_dicts and must be re-derived from the same key at load time.
 from __future__ import annotations
 
 import hashlib
+import math
 from typing import Optional
 
 import numpy as np
@@ -57,6 +58,9 @@ class KeyedLatentBottleneck(nn.Module):
         latent_size:      H = W (assumed square).
         block_size:       Dimension of each orthogonal sub-block.
                           D = C * H * W must be divisible by block_size.
+        block_layout:     "flat" keeps the legacy contiguous flatten layout.
+                          "patch" groups each block as one DiT-style
+                          C×p×p latent patch, preserving spatial locality.
         bias_scale:       Std-dev of the additive key-derived bias vector β.
                           Set to 0.0 to disable the bias term.
         mode:             Transform variant.  Currently only "block_orthogonal".
@@ -68,6 +72,7 @@ class KeyedLatentBottleneck(nn.Module):
         latent_channels: int,
         latent_size: int,
         block_size: int = 16,
+        block_layout: str = "flat",
         bias_scale: float = 0.1,
         mode: str = "block_orthogonal",
     ) -> None:
@@ -83,10 +88,31 @@ class KeyedLatentBottleneck(nn.Module):
         self.latent_channels = latent_channels
         self.latent_size = latent_size
         self.block_size = block_size
+        block_layout = str(block_layout or "flat").lower()
+        if block_layout not in {"flat", "patch"}:
+            raise ValueError(f"Unknown keyed block_layout={block_layout!r}; expected 'flat' or 'patch'.")
+
+        self.block_layout = block_layout
         self.bias_scale = bias_scale
         self.mode = mode
         self._D = D
         self._num_blocks = D // block_size
+
+        self._patch_size: Optional[int] = None
+        if self.block_layout == "patch":
+            patch_area = block_size / float(latent_channels)
+            patch_size = int(math.sqrt(patch_area))
+            if patch_size * patch_size * latent_channels != block_size:
+                raise ValueError(
+                    "block_layout='patch' requires block_size = latent_channels * p * p "
+                    f"for an integer p; got block_size={block_size}, latent_channels={latent_channels}."
+                )
+            if latent_size % patch_size != 0:
+                raise ValueError(
+                    f"latent_size={latent_size} must be divisible by patch size {patch_size} "
+                    "for block_layout='patch'."
+                )
+            self._patch_size = patch_size
 
         # ------------------------------------------------------------------
         # Derive seed from SHA-256(secret_key).
@@ -130,6 +156,44 @@ class KeyedLatentBottleneck(nn.Module):
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _flatten_for_blocks(self, z: torch.Tensor) -> torch.Tensor:
+        """Flatten a latent tensor into the configured keyed block layout."""
+        if self.block_layout == "flat":
+            return z.flatten(1)
+
+        assert self._patch_size is not None
+        B, C, H, W = z.shape
+        p = self._patch_size
+        if C != self.latent_channels or H != self.latent_size or W != self.latent_size:
+            raise ValueError(
+                f"Expected latent shape (B,{self.latent_channels},{self.latent_size},{self.latent_size}) "
+                f"for patch keyed transform, got {tuple(z.shape)}."
+            )
+        # (B,C,H,W) -> (B,H/p,W/p,C,p,p) -> (B,D). Each block is one DiT patch.
+        return (
+            z.contiguous().view(B, C, H // p, p, W // p, p)
+            .permute(0, 2, 4, 1, 3, 5)
+            .contiguous()
+            .view(B, self._D)
+        )
+
+    def _unflatten_from_blocks(self, z_flat: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
+        """Invert :meth:`_flatten_for_blocks` back to (B,C,H,W)."""
+        if self.block_layout == "flat":
+            return z_flat.view_as(like)
+
+        assert self._patch_size is not None
+        B = z_flat.shape[0]
+        C = self.latent_channels
+        H = W = self.latent_size
+        p = self._patch_size
+        return (
+            z_flat.view(B, H // p, W // p, C, p, p)
+            .permute(0, 3, 1, 4, 2, 5)
+            .contiguous()
+            .view_as(like)
+        )
 
     def _apply_blocks(self, z_flat: torch.Tensor, transpose: bool) -> torch.Tensor:
         """Apply the block-diagonal orthogonal transform (or its transpose).
@@ -182,14 +246,14 @@ class KeyedLatentBottleneck(nn.Module):
         """
         original_dtype = z.dtype
         z_f = z.float()
-        z_flat = z_f.flatten(1)                            # (B, D)
+        z_flat = self._flatten_for_blocks(z_f)             # (B, D)
 
         z_k_flat = self._apply_blocks(z_flat, transpose=False)   # Q * z
 
         if self.beta is not None:
             z_k_flat = z_k_flat + self.beta               # + β
 
-        return z_k_flat.view_as(z_f).to(original_dtype)
+        return self._unflatten_from_blocks(z_k_flat, z_f).to(original_dtype)
 
     def invert(self, z_k: torch.Tensor) -> torch.Tensor:
         """Invert the keyed transform: z = Qᵀ * (z_k − β).
@@ -205,11 +269,11 @@ class KeyedLatentBottleneck(nn.Module):
         """
         original_dtype = z_k.dtype
         z_k_f = z_k.float()
-        z_k_flat = z_k_f.flatten(1)                       # (B, D)
+        z_k_flat = self._flatten_for_blocks(z_k_f)        # (B, D)
 
         if self.beta is not None:
             z_k_flat = z_k_flat - self.beta               # subtract bias first
 
         z_flat = self._apply_blocks(z_k_flat, transpose=True)    # Qᵀ * (z_k - β)
 
-        return z_flat.view_as(z_k_f).to(original_dtype)
+        return self._unflatten_from_blocks(z_flat, z_k_f).to(original_dtype)

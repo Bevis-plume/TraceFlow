@@ -79,7 +79,19 @@ def _resolve_device(device_str: str) -> torch.device:
         if torch.backends.mps.is_available():
             return torch.device("mps")
         return torch.device("cpu")
-    return torch.device(device_str)
+    device = torch.device(device_str)
+    # Gracefully fall back when the requested accelerator is unavailable
+    # (e.g. a cuda config run on a CPU/MPS-only dev box or smoke test).
+    if device.type == "cuda" and not torch.cuda.is_available():
+        if torch.backends.mps.is_available():
+            print("[eval] CUDA unavailable, falling back to mps")
+            return torch.device("mps")
+        print("[eval] CUDA unavailable, falling back to cpu")
+        return torch.device("cpu")
+    if device.type == "mps" and not torch.backends.mps.is_available():
+        print("[eval] MPS unavailable, falling back to cpu")
+        return torch.device("cpu")
+    return device
 
 
 def _force_math_sdp_for_higher_order_grads(device: torch.device) -> None:
@@ -483,7 +495,9 @@ def evaluate(args: argparse.Namespace) -> None:  # noqa: C901  (complex but sequ
     # 2. Load checkpoint
     # ------------------------------------------------------------------
     print(f"[eval] Checkpoint: {args.checkpoint}")
-    state = torch.load(args.checkpoint, map_location=device, weights_only=True)
+    # Load onto CPU first; modules are moved to `device` via load_state_dict on
+    # already-placed modules. This avoids backend-specific map_location quirks.
+    state = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
 
     m_cfg   = state.get("model_cfg", cfg["model"])
     ae_saved = state.get("ae_cfg", None)
@@ -503,6 +517,8 @@ def evaluate(args: argparse.Namespace) -> None:  # noqa: C901  (complex but sequ
             scaling_factor=ae_saved.get("scaling_factor", 1.0),
             freeze=True,
             base_channels=ae_saved.get("base_channels", 64),
+            checkpoint_path=ae_saved.get("checkpoint_path"),
+            require_latent_stats=bool(ae_saved.get("require_latent_stats", False)),
         ).to(device)
         ae_lc = ae_saved["latent_channels"]
         ae_ls = ae_saved["latent_size"]
@@ -518,6 +534,8 @@ def evaluate(args: argparse.Namespace) -> None:  # noqa: C901  (complex but sequ
             scaling_factor=ae_cfg.get("scaling_factor", 1.0),
             freeze=True,
             base_channels=ae_cfg.get("base_channels", 64),
+            checkpoint_path=ae_cfg.get("checkpoint_path"),
+            require_latent_stats=bool(ae_cfg.get("require_latent_stats", False)),
         ).to(device)
         ae_lc = ae_cfg["latent_channels"]
         ae_ls = ae_cfg["latent_size"]
@@ -560,6 +578,7 @@ def evaluate(args: argparse.Namespace) -> None:  # noqa: C901  (complex but sequ
         dropout=0.0,
         class_conditional=m_cfg.get("class_conditional", False),
         num_classes=m_cfg.get("num_classes"),
+        time_scale=m_cfg.get("time_scale", 1.0),
     ).to(device)
 
     # Load weights (prefer EMA)
@@ -658,6 +677,7 @@ def evaluate(args: argparse.Namespace) -> None:  # noqa: C901  (complex but sequ
     # ------------------------------------------------------------------
     from src.attacks.traceflow_inversion import (
         compute_target_gradients,
+        geiping_pixel_inversion_attack,
         latent_inversion_attack,
         pixel_inversion_attack,
     )
@@ -704,6 +724,10 @@ def evaluate(args: argparse.Namespace) -> None:  # noqa: C901  (complex but sequ
         "attacker": args.attacker,
         "steps": args.steps,
         "lr": args.lr,
+        "geiping_restarts": args.geiping_restarts,
+        "geiping_tv_weight": args.geiping_tv_weight,
+        "geiping_l2_weight": args.geiping_l2_weight,
+        "geiping_frequency_weight": args.geiping_frequency_weight,
         "batch_size": B,
         "image_size": image_size,
         "transform_type": transform_type,
@@ -716,7 +740,8 @@ def evaluate(args: argparse.Namespace) -> None:  # noqa: C901  (complex but sequ
     x_shape   = (B, 3, image_size, image_size)
 
     run_latent = args.attack in ("latent", "both")
-    run_pixel  = args.attack in ("pixel",  "both")
+    run_pixel  = args.attack in ("pixel", "geiping_pixel", "both")
+    use_geiping_pixel = args.attack == "geiping_pixel"
     snapshot_steps = _parse_snapshot_steps(args.snapshot_steps, args.steps)
     if snapshot_steps:
         print(f"[eval] Attack snapshots: {snapshot_steps}")
@@ -865,35 +890,63 @@ def evaluate(args: argparse.Namespace) -> None:  # noqa: C901  (complex but sequ
         # 9b. Pixel inversion attack
         # --------------------------------------------------------------
         if run_pixel:
-            print(f"[eval] === Pixel inversion attack | steps={args.steps} lr={args.lr} ===")
+            attack_label = "Geiping-style pixel" if use_geiping_pixel else "Pixel"
+            print(f"[eval] === {attack_label} inversion attack | steps={args.steps} lr={args.lr} ===")
             pixel_t0 = time.time()
-            pixel_result = pixel_inversion_attack(
-                model=model,
-                autoencoder=autoencoder,
-                watermark_modules=watermark_modules,
-                target_grads=target_grads,
-                x_shape=x_shape,
-                attack_state=attack_state,
-                steps=args.steps,
-                lr=args.lr,
-                device=device,
-                log_interval=max(1, args.steps // 5),
-                attacker=attacker,
-                latent_transform=latent_transform,
-                snapshot_steps=snapshot_steps,
-            )
+            if use_geiping_pixel:
+                pixel_result = geiping_pixel_inversion_attack(
+                    model=model,
+                    autoencoder=autoencoder,
+                    watermark_modules=watermark_modules,
+                    target_grads=target_grads,
+                    x_shape=x_shape,
+                    attack_state=attack_state,
+                    steps=args.steps,
+                    lr=args.lr,
+                    device=device,
+                    log_interval=max(1, args.steps // 5),
+                    attacker=attacker,
+                    latent_transform=latent_transform,
+                    snapshot_steps=snapshot_steps,
+                    restarts=args.geiping_restarts,
+                    tv_weight=args.geiping_tv_weight,
+                    l2_weight=args.geiping_l2_weight,
+                    frequency_weight=args.geiping_frequency_weight,
+                )
+            else:
+                pixel_result = pixel_inversion_attack(
+                    model=model,
+                    autoencoder=autoencoder,
+                    watermark_modules=watermark_modules,
+                    target_grads=target_grads,
+                    x_shape=x_shape,
+                    attack_state=attack_state,
+                    steps=args.steps,
+                    lr=args.lr,
+                    device=device,
+                    log_interval=max(1, args.steps // 5),
+                    attacker=attacker,
+                    latent_transform=latent_transform,
+                    snapshot_steps=snapshot_steps,
+                )
             pixel_wall_time_s = time.time() - pixel_t0
             x_recon = pixel_result["x_dummy"].cpu().clamp(-1, 1)
-            _save_grid(x_recon, img_dir / f"pixel_{attacker}_raw_recon_grid.png", nrow=max(1, B))
+            pixel_prefix = "geiping_pixel" if use_geiping_pixel else "pixel"
+            _save_grid(x_recon, img_dir / f"{pixel_prefix}_{attacker}_raw_recon_grid.png", nrow=max(1, B))
 
             pixel_snapshot_paths: Dict[str, str] = {}
             for snap_step, snap_x in pixel_result.get("snapshots", {}).items():
-                snap_path = img_dir / "attack_progress" / f"pixel_{attacker}_step{snap_step:04d}.png"
+                snap_path = img_dir / "attack_progress" / f"{pixel_prefix}_{attacker}_step{snap_step:04d}.png"
                 _save_grid(snap_x.clamp(-1, 1), snap_path, nrow=max(1, B))
                 pixel_snapshot_paths[str(snap_step)] = str(snap_path)
 
             px_metrics: Dict[str, Any] = {
                 "final_gml":   pixel_result["final_gml"],
+                "attack_method": pixel_result.get("attack_method", pixel_prefix),
+                "median_final_gml": pixel_result.get("median_final_gml"),
+                "best_restart": pixel_result.get("best_restart"),
+                "restart_summaries": pixel_result.get("restart_summaries"),
+                "priors": pixel_result.get("priors"),
                 "gml_history": pixel_result["gml_history"],
                 "snapshot_paths": pixel_snapshot_paths,
                 "attack_wall_time_s": pixel_wall_time_s,
@@ -920,7 +973,7 @@ def evaluate(args: argparse.Namespace) -> None:  # noqa: C901  (complex but sequ
                 px_metrics["raw_pixel_latent_ber"]      = raw_pixel["latent_ber"]
                 px_metrics["robustness"] = _evaluate_transform_robustness(
                     x_recon,
-                    prefix=f"pixel_{attacker}",
+                    prefix=f"{pixel_prefix}_{attacker}",
                     img_dir=img_dir,
                     watermark_modules=watermark_modules,
                     latent_transform=latent_transform,
@@ -940,7 +993,7 @@ def evaluate(args: argparse.Namespace) -> None:  # noqa: C901  (complex but sequ
                 px_metrics["post_watermark_pixel_latent_ber"]      = post_px["latent_ber"]
                 _save_grid(
                     x_wm_px,
-                    img_dir / f"pixel_{attacker}_post_watermark_recon_grid.png",
+                    img_dir / f"{pixel_prefix}_{attacker}_post_watermark_recon_grid.png",
                     nrow=max(1, B),
                 )
 
@@ -1001,8 +1054,11 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--attack",
         default="latent",
-        choices=["latent", "pixel", "both"],
-        help="Which attack(s) to run (default: latent).",
+        choices=["latent", "pixel", "geiping_pixel", "both"],
+        help=(
+            "Which attack(s) to run. 'geiping_pixel' runs the stronger "
+            "multi-restart pixel attack with image priors (default: latent)."
+        ),
     )
     p.add_argument(
         "--attacker",
@@ -1016,6 +1072,34 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument("--steps",      type=int,   default=300,   help="Optimisation steps.")
     p.add_argument("--lr",         type=float, default=0.01,  help="Adam learning rate.")
+    p.add_argument(
+        "--geiping-restarts",
+        type=int,
+        default=4,
+        dest="geiping_restarts",
+        help="Number of restarts for --attack geiping_pixel (pilot default: 4).",
+    )
+    p.add_argument(
+        "--geiping-tv-weight",
+        type=float,
+        default=1.0e-4,
+        dest="geiping_tv_weight",
+        help="Total-variation prior weight for --attack geiping_pixel.",
+    )
+    p.add_argument(
+        "--geiping-l2-weight",
+        type=float,
+        default=1.0e-5,
+        dest="geiping_l2_weight",
+        help="L2 image prior weight for --attack geiping_pixel.",
+    )
+    p.add_argument(
+        "--geiping-frequency-weight",
+        type=float,
+        default=1.0e-5,
+        dest="geiping_frequency_weight",
+        help="High-frequency smoothness prior weight for --attack geiping_pixel.",
+    )
     p.add_argument(
         "--snapshot-steps",
         default="10,20,30,40,50,60,70,80,90,100",

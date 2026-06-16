@@ -162,9 +162,24 @@ class LocalAutoencoderBackend(nn.Module):
             for p in self.parameters():
                 p.requires_grad_(False)
 
+    def encode_stats(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return posterior mean and log-variance for a local VAE latent."""
+        return self.encoder(x)
+
+    def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        """Sample z from q(z|x) with the reparameterization trick."""
+        logvar = logvar.clamp(min=-20.0, max=10.0)
+        std = torch.exp(0.5 * logvar)
+        return mu + torch.randn_like(std) * std
+
+    def sample_posterior(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return (z, mu, logvar) sampled from q(z|x)."""
+        mu, logvar = self.encode_stats(x)
+        return self.reparameterize(mu, logvar), mu, logvar
+
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """Encode image to latent (deterministic, uses mean)."""
-        mu, _ = self.encoder(x)
+        mu, _ = self.encode_stats(x)
         return mu
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
@@ -173,8 +188,12 @@ class LocalAutoencoderBackend(nn.Module):
 
     def encode_with_grad(self, x: torch.Tensor) -> torch.Tensor:
         """Encode image to latent, preserving gradient flow through the computation."""
-        mu, _ = self.encoder(x)
+        mu, _ = self.encode_stats(x)
         return mu
+
+    def sample_posterior_with_grad(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Gradient-preserving posterior sample for VAE pretraining."""
+        return self.sample_posterior(x)
 
     def decode_with_grad(self, z: torch.Tensor) -> torch.Tensor:
         """Decode latent to image in [-1, 1], preserving gradient flow through the computation."""
@@ -187,6 +206,12 @@ class LocalAutoencoderBackend(nn.Module):
         """Encode then decode (reconstruction). Returns (x_hat, z)."""
         z = self.encode(x)
         return self.decode(z), z
+
+    def trainable(self) -> "LocalAutoencoderBackend":
+        """Re-enable gradients on all parameters (used by AE pretraining)."""
+        for p in self.parameters():
+            p.requires_grad_(True)
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -285,8 +310,17 @@ class AutoencoderBackend(nn.Module):
         scaling_factor: float = 1.0,
         freeze: bool = True,
         base_channels: int = 64,
+        checkpoint_path: Optional[str] = None,
+        require_latent_stats: bool = False,
     ) -> None:
         super().__init__()
+
+        self.backend_kind = backend
+        self._require_latent_stats = bool(require_latent_stats)
+        self._latent_stats_enabled = False
+        self._latent_stats_meta: dict = {}
+        self.register_buffer("_latent_mean", torch.zeros(1, latent_channels, 1, 1), persistent=False)
+        self.register_buffer("_latent_std", torch.ones(1, latent_channels, 1, 1), persistent=False)
 
         if backend == "local":
             self._backend = LocalAutoencoderBackend(
@@ -297,6 +331,17 @@ class AutoencoderBackend(nn.Module):
                 base_channels=base_channels,
                 freeze=freeze,
             )
+            # Load pretrained local AE weights when provided. This is required
+            # for serious training: a randomly initialised local AE destroys
+            # generation quality. Loading happens before freezing matters,
+            # because load_state_dict is independent of requires_grad.
+            if checkpoint_path:
+                self.load_local_checkpoint(checkpoint_path)
+            elif self._require_latent_stats:
+                raise FileNotFoundError(
+                    "require_latent_stats=True but no local AE checkpoint_path was provided. "
+                    "Pretrain the local autoencoder and load its checkpoint."
+                )
         elif backend == "diffusers":
             if pretrained_model_name_or_path is None:
                 raise ValueError(
@@ -312,20 +357,203 @@ class AutoencoderBackend(nn.Module):
         else:
             raise ValueError(f"Unknown autoencoder backend: {backend!r}. Choose 'local' or 'diffusers'.")
 
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
+    def _normalize_latent(self, z: torch.Tensor) -> torch.Tensor:
+        if not self._latent_stats_enabled:
+            return z
+        mean = self._latent_mean.to(device=z.device, dtype=z.dtype)
+        std = self._latent_std.to(device=z.device, dtype=z.dtype).clamp_min(1e-6)
+        return (z - mean) / std
+
+    def _denormalize_latent(self, z: torch.Tensor) -> torch.Tensor:
+        if not self._latent_stats_enabled:
+            return z
+        mean = self._latent_mean.to(device=z.device, dtype=z.dtype)
+        std = self._latent_std.to(device=z.device, dtype=z.dtype).clamp_min(1e-6)
+        return z * std + mean
+
+    def encode_raw(self, x: torch.Tensor) -> torch.Tensor:
+        """Encode image to the autoencoder's native, unnormalised latent."""
         return self._backend.encode(x)
 
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
+    def encode_stats_raw(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return native posterior mean/logvar when the backend supports it."""
+        if not hasattr(self._backend, "encode_stats"):
+            z = self._backend.encode(x)
+            return z, torch.zeros_like(z)
+        return self._backend.encode_stats(x)
+
+    def decode_raw(self, z: torch.Tensor) -> torch.Tensor:
+        """Decode a native, unnormalised autoencoder latent."""
         return self._backend.decode(z)
 
-    def encode_with_grad(self, x: torch.Tensor) -> torch.Tensor:
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        return self._normalize_latent(self._backend.encode(x))
+
+    def encode_stats(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        mu, logvar = self.encode_stats_raw(x)
+        return self._normalize_latent(mu), logvar
+
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        return self._backend.decode(self._denormalize_latent(z))
+
+    def encode_with_grad_raw(self, x: torch.Tensor) -> torch.Tensor:
         return self._backend.encode_with_grad(x)
 
-    def decode_with_grad(self, z: torch.Tensor) -> torch.Tensor:
+    def encode_stats_with_grad_raw(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not hasattr(self._backend, "encode_stats"):
+            z = self._backend.encode_with_grad(x)
+            return z, torch.zeros_like(z)
+        return self._backend.encode_stats(x)
+
+    def decode_with_grad_raw(self, z: torch.Tensor) -> torch.Tensor:
         return self._backend.decode_with_grad(z)
+
+    def encode_with_grad(self, x: torch.Tensor) -> torch.Tensor:
+        return self._normalize_latent(self._backend.encode_with_grad(x))
+
+    def encode_stats_with_grad(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        mu, logvar = self.encode_stats_with_grad_raw(x)
+        return self._normalize_latent(mu), logvar
+
+    def decode_with_grad(self, z: torch.Tensor) -> torch.Tensor:
+        return self._backend.decode_with_grad(self._denormalize_latent(z))
+
+    def sample_posterior_raw(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return native (z, mu, logvar) sampled from q(z|x)."""
+        if hasattr(self._backend, "sample_posterior"):
+            return self._backend.sample_posterior(x)
+        mu = self._backend.encode(x)
+        return mu, mu, torch.zeros_like(mu)
+
+    def sample_posterior_with_grad_raw(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if hasattr(self._backend, "sample_posterior_with_grad"):
+            return self._backend.sample_posterior_with_grad(x)
+        mu = self._backend.encode_with_grad(x)
+        return mu, mu, torch.zeros_like(mu)
+
+    def sample_posterior(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        z, mu, logvar = self.sample_posterior_raw(x)
+        return self._normalize_latent(z), self._normalize_latent(mu), logvar
+
+    def sample_posterior_with_grad(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        z, mu, logvar = self.sample_posterior_with_grad_raw(x)
+        return self._normalize_latent(z), self._normalize_latent(mu), logvar
+
+    def latent_stats_enabled(self) -> bool:
+        return bool(self._latent_stats_enabled)
+
+    def latent_stats_metadata(self) -> dict:
+        if not self._latent_stats_enabled:
+            return {"enabled": False}
+        meta = dict(self._latent_stats_meta)
+        meta.update({
+            "enabled": True,
+            "mean": self._latent_mean.detach().cpu().view(-1).tolist(),
+            "std": self._latent_std.detach().cpu().view(-1).tolist(),
+        })
+        return meta
+
+    def set_latent_stats(self, stats: Optional[dict]) -> None:
+        """Enable per-channel latent standardisation from checkpoint metadata."""
+        if not stats or not stats.get("enabled", True):
+            self._latent_stats_enabled = False
+            self._latent_stats_meta = {"enabled": False}
+            return
+        mean = torch.as_tensor(stats.get("mean"), dtype=torch.float32).view(1, -1, 1, 1)
+        std = torch.as_tensor(stats.get("std"), dtype=torch.float32).view(1, -1, 1, 1)
+        if mean.numel() != self._latent_mean.numel() or std.numel() != self._latent_std.numel():
+            raise RuntimeError(
+                "Local AE latent stats do not match latent_channels. "
+                f"stats mean={mean.numel()} std={std.numel()} expected={self._latent_mean.numel()}"
+            )
+        if torch.any(std <= 0):
+            raise RuntimeError("Local AE latent stats contain non-positive std values.")
+        self._latent_mean.copy_(mean.to(self._latent_mean.device))
+        self._latent_std.copy_(std.to(self._latent_std.device).clamp_min(1e-6))
+        self._latent_stats_enabled = True
+        self._latent_stats_meta = {k: v for k, v in stats.items() if k not in {"mean", "std"}}
 
     def latent_shape(self, image_size: int) -> Tuple[int, int, int]:
         return self._backend.latent_shape(image_size)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self._backend(x)
+        z = self.encode(x)
+        return self.decode(z), z
+
+    # ------------------------------------------------------------------
+    # Local-backend checkpoint helpers
+    # ------------------------------------------------------------------
+    def local_state_dict(self) -> dict:
+        """Return the inner local backend state dict (unprefixed keys)."""
+        if not isinstance(self._backend, LocalAutoencoderBackend):
+            raise RuntimeError("local_state_dict is only available for backend='local'.")
+        return self._backend.state_dict()
+
+    def load_local_checkpoint(self, path: str, map_location: str = "cpu") -> dict:
+        """Load pretrained local-autoencoder weights from a checkpoint file.
+
+        The checkpoint may either be a raw ``state_dict`` or a dict produced by
+        :func:`save_local_autoencoder` containing a ``"state_dict"`` key. Keys
+        may optionally be prefixed with ``"_backend."`` (when the whole
+        :class:`AutoencoderBackend` was saved); the prefix is stripped.
+        """
+        if not isinstance(self._backend, LocalAutoencoderBackend):
+            raise RuntimeError("load_local_checkpoint is only valid for backend='local'.")
+        import os
+
+        if not os.path.isfile(path):
+            raise FileNotFoundError(
+                f"Local autoencoder checkpoint not found: {path}. "
+                "Pretrain it first with `python -m scripts.pretrain_autoencoder` "
+                "or `python -m scripts.traceflow train-autoencoder`."
+            )
+        ckpt = torch.load(path, map_location=map_location, weights_only=False)
+        state = ckpt.get("state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
+        if any(k.startswith("_backend.") for k in state):
+            state = {k[len("_backend."):]: v for k, v in state.items() if k.startswith("_backend.")}
+        missing, unexpected = self._backend.load_state_dict(state, strict=False)
+        if missing or unexpected:
+            raise RuntimeError(
+                "Local autoencoder checkpoint does not match the configured AE "
+                f"architecture. Missing keys: {list(missing)[:6]} ... "
+                f"Unexpected keys: {list(unexpected)[:6]} ... "
+                "Check that latent_channels/latent_size/base_channels/image_size "
+                "match the pretrained AE."
+            )
+        payload = ckpt if isinstance(ckpt, dict) else {}
+        stats = payload.get("latent_stats") or payload.get("metrics", {}).get("latent_stats")
+        if stats:
+            self.set_latent_stats(stats)
+        elif self._require_latent_stats:
+            raise RuntimeError(
+                f"Local autoencoder checkpoint {path} has no latent_stats metadata. "
+                "Regenerate it with the current pretrain_autoencoder script so flow training "
+                "uses a sampleable standard-normal latent space."
+            )
+        return payload
+
+
+def save_local_autoencoder(
+    backend: "AutoencoderBackend",
+    path: str,
+    *,
+    config: Optional[dict] = None,
+    metrics: Optional[dict] = None,
+    latent_stats: Optional[dict] = None,
+) -> None:
+    """Persist a local autoencoder backend to ``path``.
+
+    Stores the unprefixed local state dict plus optional ``config``/``metrics``
+    so the checkpoint can be validated and re-loaded by
+    :meth:`AutoencoderBackend.load_local_checkpoint`.
+    """
+    import os
+
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    payload = {
+        "state_dict": backend.local_state_dict(),
+        "config": config or {},
+        "metrics": metrics or {},
+        "latent_stats": latent_stats or {},
+    }
+    torch.save(payload, path)

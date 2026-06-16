@@ -78,7 +78,8 @@ def _run_attack(
         "--attack", attack_type,
         "--attacker", "no_key",
         "--steps", str(steps),
-        "--batch-size", "1" if smoke else "2",
+        # Inversion eval runs at batch size 1 to stay within 32GB VRAM (RTX 5090).
+        "--batch-size", "1",
         "--data-source", data_source,
         "--output-dir", str(out_dir),
     ]

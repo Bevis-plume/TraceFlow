@@ -144,7 +144,8 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     # ------------------------------------------------------------------ #
     # 2. Inversion evaluation                                              #
     # ------------------------------------------------------------------ #
-    inversion_out = exp_dir / "inversion"
+    inversion_dir_name = "strong_inversion_geiping" if attack_type == "geiping_pixel" else "inversion"
+    inversion_out = exp_dir / inversion_dir_name
     inversion_out.mkdir(parents=True, exist_ok=True)
 
     eval_cmd = [
@@ -154,7 +155,8 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         "--attack", attack_type,
         "--attacker", attacker,
         "--steps", str(attack_steps),
-        "--batch-size", "1" if smoke else "2",
+        # Inversion eval runs at batch size 1 to stay within 32GB VRAM (RTX 5090).
+        "--batch-size", "1",
         "--data-source", data_source,
         "--output-dir", str(inversion_out),
     ]

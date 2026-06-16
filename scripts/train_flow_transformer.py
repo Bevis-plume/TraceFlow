@@ -44,7 +44,19 @@ def _resolve_device(device_str: str) -> torch.device:
         if torch.backends.mps.is_available():
             return torch.device("mps")
         return torch.device("cpu")
-    return torch.device(device_str)
+    device = torch.device(device_str)
+    # Gracefully fall back when the requested accelerator is unavailable
+    # (e.g. a cuda config run on a CPU/MPS-only dev box or smoke test).
+    if device.type == "cuda" and not torch.cuda.is_available():
+        if torch.backends.mps.is_available():
+            print("[train] CUDA unavailable, falling back to mps")
+            return torch.device("mps")
+        print("[train] CUDA unavailable, falling back to cpu")
+        return torch.device("cpu")
+    if device.type == "mps" and not torch.backends.mps.is_available():
+        print("[train] MPS unavailable, falling back to cpu")
+        return torch.device("cpu")
+    return device
 
 
 def _get_autocast_ctx(mixed_precision: str, device: torch.device):
@@ -254,6 +266,74 @@ def _save_latent_trajectory_3d(trajectory: torch.Tensor, path: str) -> None:
         json.dump(payload, f, indent=2)
 
 
+def _write_json(path: Path | str, payload: Dict[str, Any]) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+
+
+def _tensor_stats(x: torch.Tensor) -> Dict[str, float]:
+    x = x.detach().float().cpu()
+    return {
+        "mean": float(x.mean().item()),
+        "std": float(x.std(unbiased=False).item()),
+        "min": float(x.min().item()),
+        "max": float(x.max().item()),
+        "rms": float(x.pow(2).mean().sqrt().item()),
+        "finite_fraction": float(torch.isfinite(x).float().mean().item()),
+    }
+
+
+def _write_generated_latent_stats(
+    path: Path | str,
+    *,
+    z_protected: torch.Tensor,
+    z_native: torch.Tensor,
+    images: torch.Tensor,
+    labels: Optional[torch.Tensor],
+) -> None:
+    payload: Dict[str, Any] = {
+        "protected_latent": _tensor_stats(z_protected),
+        "native_latent": _tensor_stats(z_native),
+        "decoded_images": _tensor_stats(images),
+    }
+    if labels is not None:
+        payload["class_labels"] = [int(v) for v in labels.detach().cpu().view(-1).tolist()]
+    _write_json(path, payload)
+
+
+@torch.no_grad()
+def _write_denoise_probe(
+    path: Path | str,
+    *,
+    model: nn.Module,
+    autoencoder,
+    latent_transform: nn.Module,
+    x: torch.Tensor,
+    y: Optional[torch.Tensor],
+    t_value: float = 0.5,
+) -> None:
+    """Save original / noisy-latent decode / one-step denoise decode.
+
+    If this probe looks good while random samples look bad, the model has
+    learned local denoising but the prior/sampler path is still wrong. If this
+    is bad too, the flow itself has not learned the training distribution.
+    """
+    from src.generation.rectified_flow import interpolate
+
+    B = x.size(0)
+    z_real_k = latent_transform(autoencoder.encode(x))
+    eps = torch.randn_like(z_real_k)
+    t = torch.full((B,), float(t_value), device=x.device, dtype=torch.float32)
+    z_t_k = interpolate(z_real_k, eps, t)
+    v_pred = model(z_t_k, t, y)
+    z_hat_k = z_t_k - t.view(B, 1, 1, 1) * v_pred
+    x_noisy = autoencoder.decode(latent_transform.invert(z_t_k)).clamp(-1.0, 1.0)
+    x_hat = autoencoder.decode(latent_transform.invert(z_hat_k)).clamp(-1.0, 1.0)
+    grid = torch.cat([x.detach().cpu(), x_noisy.cpu(), x_hat.cpu()], dim=0)
+    _save_image_grid(grid, str(path), nrow=B)
+
+
 def _cosine_warmup_lr(optimizer, step: int, warmup_steps: int, base_lr: float) -> None:
     """Apply linear warmup to optimizer learning rate."""
     if step < warmup_steps:
@@ -374,6 +454,16 @@ def train(args: argparse.Namespace) -> None:
     print(f"[train] Dataset: {cfg['data']['name']} | {len(dataset)} samples | "
           f"batch_size={cfg['training']['batch_size']}")
 
+    # Fixed real examples for denoise probes. Keeping them on CPU avoids
+    # pinning GPU memory for the whole run; they are moved to device only when
+    # a sample interval fires.
+    _diag_batch = next(iter(loader))
+    diagnostic_x = _diag_batch[0][:min(4, cfg["training"]["batch_size"])].detach().cpu()
+    diagnostic_y = None
+    if m_cfg := cfg.get("model", {}):
+        if m_cfg.get("class_conditional", False) and len(_diag_batch) > 1:
+            diagnostic_y = _diag_batch[1][:diagnostic_x.size(0)].detach().cpu().long()
+
     # ------------------------------------------------------------------
     # 4. Autoencoder
     # ------------------------------------------------------------------
@@ -389,9 +479,26 @@ def train(args: argparse.Namespace) -> None:
         scaling_factor=ae_cfg.get("scaling_factor", 1.0),
         freeze=ae_cfg.get("freeze", True),
         base_channels=ae_cfg.get("base_channels", 64),
+        checkpoint_path=None if smoke else ae_cfg.get("checkpoint_path"),
+        require_latent_stats=False if smoke else bool(ae_cfg.get("require_latent_stats", False)),
     ).to(device)
+    _ae_ckpt = None if smoke else ae_cfg.get("checkpoint_path")
+    if ae_cfg.get("backend", "local") == "local" and not _ae_ckpt and not smoke:
+        print(
+            "[train] WARNING: local autoencoder backend with no "
+            "autoencoder.checkpoint_path. Training the flow model against a "
+            "randomly initialised AE will produce poor samples. Pretrain it with "
+            "`python -m scripts.traceflow train-autoencoder` first."
+        )
     print(f"[train] Autoencoder backend: {ae_cfg.get('backend', 'local')} | "
-          f"latent {ae_cfg['latent_channels']}x{ae_cfg['latent_size']}x{ae_cfg['latent_size']}")
+          f"latent {ae_cfg['latent_channels']}x{ae_cfg['latent_size']}x{ae_cfg['latent_size']}"
+          + (f" | loaded checkpoint {_ae_ckpt}" if _ae_ckpt else ""))
+    if hasattr(autoencoder, "latent_stats_enabled") and autoencoder.latent_stats_enabled():
+        stats = autoencoder.latent_stats_metadata()
+        avg_std = sum(stats.get("std", [1.0])) / max(len(stats.get("std", [])), 1)
+        print(f"[train] AE latent normalization: enabled ({stats.get('type', 'unknown')}, avg_std={avg_std:.4f})")
+    elif ae_cfg.get("backend", "local") == "local" and not smoke:
+        print("[train] WARNING: AE latent normalization is disabled; generation quality may collapse.")
 
     # Sanity-check: one encode/decode pass
     with torch.no_grad():
@@ -425,8 +532,15 @@ def train(args: argparse.Namespace) -> None:
     from src.models.flow_transformer import build_flow_transformer
 
     m_cfg = cfg["model"]
+    # When the config carries fully-resolved architecture dims, they are
+    # authoritative: ignore any `preset` so it does not silently override the
+    # explicit hidden_size/depth/num_heads (a preset like DiT-S would otherwise
+    # rebuild a different model than the config specifies, and a different one
+    # than the eval/sample loaders reconstruct — causing checkpoint mismatches).
+    _has_resolved = all(k in m_cfg for k in ("hidden_size", "depth", "num_heads"))
+    _preset = None if _has_resolved else m_cfg.get("preset")
     model = build_flow_transformer(
-        preset=m_cfg.get("preset"),
+        preset=_preset,
         latent_channels=m_cfg["latent_channels"],
         latent_size=m_cfg["latent_size"],
         patch_size=m_cfg.get("patch_size", 2),
@@ -437,7 +551,12 @@ def train(args: argparse.Namespace) -> None:
         dropout=m_cfg.get("dropout", 0.0),
         class_conditional=m_cfg.get("class_conditional", False),
         num_classes=m_cfg.get("num_classes"),
+        time_scale=m_cfg.get("time_scale", 1.0),
     ).to(device)
+    print(f"[train] FlowTransformer arch: hidden={m_cfg.get('hidden_size', 512)} "
+          f"depth={m_cfg.get('depth', 12)} heads={m_cfg.get('num_heads', 8)} "
+          f"patch={m_cfg.get('patch_size', 2)} time_scale={m_cfg.get('time_scale', 1.0)} "
+          f"(preset={'ignored (resolved dims)' if _has_resolved else _preset})")
 
     if cfg["training"].get("torch_compile", False) and device.type == "cuda":
         print("[train] torch.compile: enabled")
@@ -566,12 +685,49 @@ def train(args: argparse.Namespace) -> None:
         if "ema_model" in state:
             ema.load_state_dict(state["ema_model"])
         start_step = int(state.get("step", 0))
+        # Restore EMA warmup counter so a resumed run keeps the converged decay
+        # instead of re-warming up from scratch.
+        ema.num_updates = start_step
         print(f"[train] Resumed from {args.resume} at step {start_step} (model/EMA/watermark restored)")
+
+    # ------------------------------------------------------------------
+    # 8b. Warm-start (--init-from): initialise the flow model + EMA from a
+    # previously trained checkpoint (e.g. the baseline generator) without
+    # restoring optimizer state or step count. This protects image quality
+    # when training the heavier full-TraceFlow watermark path from a good
+    # generator rather than from scratch. Watermark modules stay fresh.
+    # ------------------------------------------------------------------
+    elif getattr(args, "init_from", None):
+        init_state = torch.load(args.init_from, map_location=device, weights_only=True)
+        if "model" not in init_state:
+            raise RuntimeError(f"--init-from checkpoint has no 'model' state: {args.init_from}")
+        missing, unexpected = model.load_state_dict(init_state["model"], strict=False)
+        if unexpected:
+            raise RuntimeError(
+                f"--init-from checkpoint is incompatible with the current model "
+                f"(unexpected keys: {list(unexpected)[:6]}). Ensure the generator "
+                "and full-TraceFlow models share the same architecture/config."
+            )
+        if missing:
+            print(f"[train] init-from: {len(missing)} model params kept at fresh init "
+                  f"(e.g. {list(missing)[:3]})")
+        if "ema_model" in init_state:
+            try:
+                ema.load_state_dict(init_state["ema_model"])
+                # Preserve the source EMA update count when warm-starting from
+                # a mature generator. Otherwise EMA warmup restarts at zero and
+                # the early full-TraceFlow pilot can over-track fresh updates.
+                ema.num_updates = int(init_state.get("step", 0) or 0)
+            except Exception as exc:  # noqa: BLE001 - EMA shape mismatch is non-fatal
+                print(f"[train] init-from: EMA not restored ({exc}); reinitialising EMA from model.")
+                ema = EMAModel(model, decay=cfg["training"].get("ema_decay", 0.9999))
+        print(f"[train] Warm-started flow model + EMA from {args.init_from} "
+              "(optimizer/step fresh; watermark modules fresh)")
 
     # ------------------------------------------------------------------
     # 9. Training loop
     # ------------------------------------------------------------------
-    from src.generation.rectified_flow import flow_loss, flow_loss_with_state
+    from src.generation.rectified_flow import flow_loss_with_state
 
     num_steps = cfg["training"]["num_steps"]
     grad_accum = cfg["training"]["grad_accum_steps"]
@@ -580,6 +736,12 @@ def train(args: argparse.Namespace) -> None:
     save_interval = cfg["training"]["save_interval"]
     warmup_steps = cfg["training"].get("warmup_steps", 0)
     clean_fp_interval = int(cfg["training"].get("clean_fp_interval", 500))
+    flow_cfg = cfg.get("flow_matching", {}) or {}
+    probe_t_values = [float(v) for v in flow_cfg.get("denoise_probe_t_values", [0.5])]
+    sampling_cfg = cfg.get("sampling", {}) or {}
+    guidance_scale = float(sampling_cfg.get("guidance_scale", 1.0))
+    print(f"[train] Flow matching config: {flow_cfg if flow_cfg else 'velocity-only uniform-t'}")
+    print(f"[train] Sampling CFG guidance_scale={guidance_scale:.3f}")
 
     model.train()
     autoencoder.eval()
@@ -593,6 +755,10 @@ def train(args: argparse.Namespace) -> None:
     accum_count = 0
     # Running watermark stats for logging (reset each log interval).
     accum_flow = 0.0
+    accum_flow_velocity = 0.0
+    accum_flow_x0 = 0.0
+    accum_flow_t_mean = 0.0
+    accum_flow_high_t_fraction = 0.0
     accum_wm = 0.0
     accum_img = 0.0
     accum_residual = 0.0
@@ -660,7 +826,7 @@ def train(args: argparse.Namespace) -> None:
                 clean_bitacc_lat_step = None
 
                 if watermark is not None:
-                    flow_state = flow_loss_with_state(model, z_k, y=y)
+                    flow_state = flow_loss_with_state(model, z_k, y=y, flow_cfg=flow_cfg)
                     flow_l = flow_state["loss"]
                     z_hat_k = flow_state["z_hat"]
 
@@ -795,7 +961,8 @@ def train(args: argparse.Namespace) -> None:
                         + phase["polish"] * wm_cfg.get("lambda_frequency", 0.0) * frequency_l
                     )
                 else:
-                    flow_l = flow_loss(model, z_k, y=y)
+                    flow_state = flow_loss_with_state(model, z_k, y=y, flow_cfg=flow_cfg)
+                    flow_l = flow_state["loss"]
                     sub_loss = flow_l
 
                 sub_loss = sub_loss / grad_accum  # scale for correct gradient sum
@@ -809,6 +976,10 @@ def train(args: argparse.Namespace) -> None:
 
             # Accumulate component metrics for logging.
             accum_flow += flow_l.item()
+            accum_flow_velocity += float(flow_state.get("loss_velocity", flow_l).detach().item())
+            accum_flow_x0 += float(flow_state.get("loss_x0", torch.zeros((), device=device)).detach().item())
+            accum_flow_t_mean += float(flow_state.get("t_mean", torch.zeros((), device=device)).detach().item())
+            accum_flow_high_t_fraction += float(flow_state.get("high_t_fraction", torch.zeros((), device=device)).detach().item())
             if watermark is not None:
                 accum_wm += wm_l.item()
                 accum_img += img_l.item()
@@ -864,6 +1035,10 @@ def train(args: argparse.Namespace) -> None:
                 "learning_rate": optimizer.param_groups[0].get("lr"),
             }
             record["loss_flow"] = accum_flow / n_sub
+            record["loss_flow_velocity"] = accum_flow_velocity / n_sub
+            record["loss_flow_x0"] = accum_flow_x0 / n_sub
+            record["flow_t_mean"] = accum_flow_t_mean / n_sub
+            record["flow_high_t_fraction"] = accum_flow_high_t_fraction / n_sub
             if watermark is not None:
                 record["loss_wm_img"] = accum_wm / n_sub
                 record["loss_wm_latent"] = accum_wm_latent / n_sub
@@ -891,6 +1066,8 @@ def train(args: argparse.Namespace) -> None:
                 print(
                     f"[train] step={step:6d}  loss={avg_loss:.4f}  "
                     f"flow={record['loss_flow']:.4f}  "
+                    f"v={record['loss_flow_velocity']:.4f}  x0={record['loss_flow_x0']:.4f}  "
+                    f"t={record['flow_t_mean']:.3f}  high_t={record['flow_high_t_fraction']:.3f}  "
                     f"wm_img={record['loss_wm_img']:.4f}  wm_lat={record['loss_wm_latent']:.4f}  "
                     f"carrier={record['wm_carrier_scale']:.3f}  "
                     f"wm_rob={record['loss_wm_robust']:.4f}  clean_neg={record['loss_clean_negative']:.4f}  "
@@ -903,10 +1080,20 @@ def train(args: argparse.Namespace) -> None:
                     f"elapsed={elapsed:.1f}s"
                 )
             else:
-                print(f"[train] step={step:6d}  loss={avg_loss:.4f}  elapsed={elapsed:.1f}s")
+                print(
+                    f"[train] step={step:6d}  loss={avg_loss:.4f}  "
+                    f"flow={record['loss_flow']:.4f}  "
+                    f"v={record['loss_flow_velocity']:.4f}  x0={record['loss_flow_x0']:.4f}  "
+                    f"t={record['flow_t_mean']:.3f}  high_t={record['flow_high_t_fraction']:.3f}  "
+                    f"elapsed={elapsed:.1f}s"
+                )
             accum_loss = 0.0
             accum_count = 0
             accum_flow = 0.0
+            accum_flow_velocity = 0.0
+            accum_flow_x0 = 0.0
+            accum_flow_t_mean = 0.0
+            accum_flow_high_t_fraction = 0.0
             accum_wm = 0.0
             accum_img = 0.0
             accum_residual = 0.0
@@ -931,7 +1118,7 @@ def train(args: argparse.Namespace) -> None:
         # Sample grid
         if step % sample_interval == 0:
             model.eval()
-            with torch.no_grad():
+            with ema.average_parameters(model), torch.no_grad():
                 from src.generation.rectified_flow import sample_euler_trajectory
                 latent_shape = (
                     min(4, cfg["training"]["batch_size"]),
@@ -940,18 +1127,67 @@ def train(args: argparse.Namespace) -> None:
                     ae_cfg["latent_size"],
                 )
                 y_sample = None
+                sample_num_classes = None
                 if m_cfg.get("class_conditional", False):
-                    num_classes = int(m_cfg.get("num_classes") or 1000)
-                    y_sample = torch.randint(num_classes, (latent_shape[0],), device=device)
-                z0_k, z_traj_k = sample_euler_trajectory(model, latent_shape, cfg["sampling"]["steps"], device, y=y_sample)
+                    sample_num_classes = int(m_cfg.get("num_classes") or 1000)
+                    y_sample = torch.randint(sample_num_classes, (latent_shape[0],), device=device)
+                z0_k, z_traj_k = sample_euler_trajectory(
+                    model,
+                    latent_shape,
+                    cfg["sampling"]["steps"],
+                    device,
+                    y=y_sample,
+                    guidance_scale=guidance_scale,
+                    num_classes=sample_num_classes,
+                )
                 # Invert key transform before decoding so samples look meaningful.
                 z0 = latent_transform.invert(z0_k)
                 images = autoencoder.decode(z0)
+                diag_x = diagnostic_x.to(device, non_blocking=True)
+                diag_y = diagnostic_y.to(device, non_blocking=True) if diagnostic_y is not None else None
             sample_path = str(output_dir / f"samples_step{step:06d}.png")
             _save_image_grid(images.cpu(), sample_path, nrow=2)
+            stats_path = output_dir / f"generated_latent_stats_step{step:06d}.json"
+            _write_generated_latent_stats(
+                stats_path,
+                z_protected=z0_k,
+                z_native=z0,
+                images=images,
+                labels=y_sample,
+            )
+            probe_paths = []
+            with ema.average_parameters(model), torch.no_grad():
+                for probe_t in probe_t_values:
+                    t_tag = int(round(float(probe_t) * 100))
+                    probe_path = output_dir / f"denoise_probe_t{t_tag:03d}_step{step:06d}.png"
+                    _write_denoise_probe(
+                        probe_path,
+                        model=model,
+                        autoencoder=autoencoder,
+                        latent_transform=latent_transform,
+                        x=diag_x,
+                        y=diag_y,
+                        t_value=float(probe_t),
+                    )
+                    probe_paths.append(probe_path)
+                if probe_t_values:
+                    legacy_probe_path = output_dir / f"denoise_probe_step{step:06d}.png"
+                    _write_denoise_probe(
+                        legacy_probe_path,
+                        model=model,
+                        autoencoder=autoencoder,
+                        latent_transform=latent_transform,
+                        x=diag_x,
+                        y=diag_y,
+                        t_value=float(probe_t_values[0]),
+                    )
+                    probe_paths.append(legacy_probe_path)
             traj_path = str(output_dir / f"latent_trajectory_step{step:06d}.json")
             _save_latent_trajectory_3d(z_traj_k, traj_path)
             print(f"[train] Saved sample grid: {sample_path}")
+            print(f"[train] Saved generated latent stats: {stats_path}")
+            for probe_path in probe_paths:
+                print(f"[train] Saved denoise probe: {probe_path}")
             print(f"[train] Saved latent trajectory: {traj_path}")
 
             if watermark is not None:
@@ -985,12 +1221,17 @@ def train(args: argparse.Namespace) -> None:
 
             ae_cfg_snapshot = {
                 "backend": ae_cfg.get("backend", "local"),
+                "kind": ae_cfg.get("kind", "deterministic"),
                 "pretrained_model_name_or_path": ae_cfg.get("pretrained_model_name_or_path"),
+                "checkpoint_path": ae_cfg.get("checkpoint_path"),
                 "latent_channels": ae_cfg["latent_channels"],
                 "image_size": cfg["data"]["image_size"],
                 "latent_size": ae_cfg["latent_size"],
                 "scaling_factor": ae_cfg.get("scaling_factor", 1.0),
                 "base_channels": ae_cfg.get("base_channels", 64),
+                "require_latent_stats": bool(ae_cfg.get("require_latent_stats", False)),
+                "require_prior_diagnostics": bool(ae_cfg.get("require_prior_diagnostics", False)),
+                "latent_stats": autoencoder.latent_stats_metadata() if hasattr(autoencoder, "latent_stats_metadata") else {},
             }
             training_cfg_snapshot = {
                 "run_name": run_name,
@@ -1011,6 +1252,7 @@ def train(args: argparse.Namespace) -> None:
                     # secret_key is intentionally NOT saved here.
                     "type": sec_cfg.get("latent_transform", {}).get("type", "identity"),
                     "block_size": sec_cfg.get("latent_transform", {}).get("block_size", 16),
+                    "block_layout": sec_cfg.get("latent_transform", {}).get("block_layout", "flat"),
                     "bias_scale": sec_cfg.get("latent_transform", {}).get("bias_scale", 0.1),
                     "latent_channels": ae_cfg["latent_channels"],
                     "latent_size": ae_cfg["latent_size"],
@@ -1063,6 +1305,9 @@ def train(args: argparse.Namespace) -> None:
         "checkpoint": str(checkpoint_dir / "latest.pt"),
         "output_dir": str(output_dir),
         "resolved_config": str(resolved_cfg_path),
+        "eval_weights": "ema",
+        "autoencoder_kind": ae_cfg.get("kind", "deterministic"),
+        "autoencoder_latent_stats": autoencoder.latent_stats_metadata() if hasattr(autoencoder, "latent_stats_metadata") else {},
     }
 
     # Final TraceFlow watermark evaluation.
@@ -1071,7 +1316,7 @@ def train(args: argparse.Namespace) -> None:
         extractor.eval()
         decoder_adapter.eval()
         latent_detector.eval()
-        with torch.no_grad():
+        with ema.average_parameters(model), torch.no_grad():
             from src.generation.rectified_flow import sample_euler
             latent_shape = (
                 min(4, cfg["training"]["batch_size"]),
@@ -1080,10 +1325,19 @@ def train(args: argparse.Namespace) -> None:
                 ae_cfg["latent_size"],
             )
             y_sample = None
+            sample_num_classes = None
             if m_cfg.get("class_conditional", False):
-                num_classes = int(m_cfg.get("num_classes") or 1000)
-                y_sample = torch.randint(num_classes, (latent_shape[0],), device=device)
-            z0_k = sample_euler(model, latent_shape, cfg["sampling"]["steps"], device, y=y_sample)
+                sample_num_classes = int(m_cfg.get("num_classes") or 1000)
+                y_sample = torch.randint(sample_num_classes, (latent_shape[0],), device=device)
+            z0_k = sample_euler(
+                model,
+                latent_shape,
+                cfg["sampling"]["steps"],
+                device,
+                y=y_sample,
+                guidance_scale=guidance_scale,
+                num_classes=sample_num_classes,
+            )
             z0 = latent_transform.invert(z0_k)
             x_dec = autoencoder.decode(z0)
             eval_bits = expand_bits(wm_bits, x_dec.size(0)).to(device)
@@ -1108,6 +1362,7 @@ def train(args: argparse.Namespace) -> None:
             "type": wm_type,
             "bit_length": watermark["config"]["bit_length"],
             "alpha": watermark["config"]["alpha"],
+            "eval_weights": "ema",
             "generated_image_bit_acc": final_acc,
             "ber_img": final_ber,
             "image_delta_mse": final_dmse,
@@ -1140,6 +1395,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=str, required=True, help="Path to YAML config file.")
     parser.add_argument("--smoke", action="store_true", help="Run a quick smoke test.")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from.")
+    parser.add_argument(
+        "--init-from", dest="init_from", type=str, default=None,
+        help="Warm-start the flow model + EMA from this checkpoint (e.g. the "
+             "baseline generator) without restoring optimizer/step. Watermark "
+             "modules stay freshly initialised. Ignored when --resume is set.",
+    )
     parser.add_argument(
         "--run-name", type=str, default=None,
         help="Name for this run (used in output/checkpoint sub-directories). "

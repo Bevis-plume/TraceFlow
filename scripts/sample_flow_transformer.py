@@ -32,7 +32,19 @@ def _resolve_device(device_str: str) -> torch.device:
         if torch.backends.mps.is_available():
             return torch.device("mps")
         return torch.device("cpu")
-    return torch.device(device_str)
+    device = torch.device(device_str)
+    # Gracefully fall back when the requested accelerator is unavailable
+    # (e.g. a cuda config run on a CPU/MPS-only dev box or smoke test).
+    if device.type == "cuda" and not torch.cuda.is_available():
+        if torch.backends.mps.is_available():
+            print("[sample] CUDA unavailable, falling back to mps")
+            return torch.device("mps")
+        print("[sample] CUDA unavailable, falling back to cpu")
+        return torch.device("cpu")
+    if device.type == "mps" and not torch.backends.mps.is_available():
+        print("[sample] MPS unavailable, falling back to cpu")
+        return torch.device("cpu")
+    return device
 
 
 def sample(args: argparse.Namespace) -> None:
@@ -46,12 +58,18 @@ def sample(args: argparse.Namespace) -> None:
     num_samples = args.num_samples or cfg["sampling"].get("num_samples", 16)
     steps = args.steps or cfg["sampling"].get("steps", 50)
     sampler = args.sampler or cfg["sampling"].get("sampler", "euler")
+    guidance_scale = (
+        float(args.guidance_scale)
+        if args.guidance_scale is not None
+        else float(cfg.get("sampling", {}).get("guidance_scale", 1.0))
+    )
     seed = args.seed
     output_dir = Path(
         args.output_dir
         or (cfg["project"].get("output_dir", "outputs/flow_transformer") + "/samples")
     )
-    use_ema = not args.no_ema
+    requested_ema = not args.no_ema
+    used_ema = False
 
     device = _resolve_device(cfg["project"].get("device", "auto"))
     print(f"[sample] Device: {device}")
@@ -66,7 +84,9 @@ def sample(args: argparse.Namespace) -> None:
     # 2. Load checkpoint — resolve architecture from saved config
     # ------------------------------------------------------------------
     print(f"[sample] Loading checkpoint: {args.checkpoint}")
-    state = torch.load(args.checkpoint, map_location=device, weights_only=True)
+    # Load onto CPU first; model/modules are moved to `device` via load_state_dict
+    # on already-placed modules. This avoids backend-specific map_location quirks.
+    state = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
 
     # Use architecture that was saved at checkpoint time (overrides YAML config).
     # This lets the smoke checkpoint be loaded with the full config YAML present.
@@ -104,8 +124,16 @@ def sample(args: argparse.Namespace) -> None:
     _lt_ls = ae_saved["latent_size"] if ae_saved is not None else cfg["autoencoder"]["latent_size"]
     if transform_type == "keyed" and _lt_secret:
         from src.security.factory import build_latent_transform
+        lt_cfg = dict(sec_cfg.get("latent_transform", {}) or {})
+        # The secret stays private in the config, but non-secret transform shape
+        # metadata must match the checkpoint that produced the protected latents.
+        for key in ("block_size", "block_layout", "bias_scale"):
+            if key in transform_meta:
+                lt_cfg[key] = transform_meta[key]
+        if "block_layout" not in transform_meta:
+            lt_cfg["block_layout"] = "flat"
         latent_transform = build_latent_transform(
-            sec_cfg,
+            {"latent_transform": lt_cfg},
             latent_channels=_lt_lc,
             latent_size=_lt_ls,
         ).to(device)
@@ -126,7 +154,25 @@ def sample(args: argparse.Namespace) -> None:
     # ------------------------------------------------------------------
     from src.models.autoencoder_backend import AutoencoderBackend
 
+    ae_checkpoint_path = None
+    autoencoder_checkpoint_loaded = False
     if ae_saved is not None:
+        ae_checkpoint_path = ae_saved.get("checkpoint_path")
+        if ae_saved.get("backend", "local") == "local" and not ae_checkpoint_path:
+            ae_checkpoint_path = cfg.get("autoencoder", {}).get("checkpoint_path")
+        if ae_saved.get("backend", "local") == "local":
+            if not ae_checkpoint_path:
+                raise FileNotFoundError(
+                    "Checkpoint uses backend='local' but does not record an AE checkpoint_path, "
+                    "and config autoencoder.checkpoint_path is unset. Refusing to sample with a "
+                    "randomly initialised autoencoder."
+                )
+            if not Path(ae_checkpoint_path).expanduser().is_file():
+                raise FileNotFoundError(
+                    f"Local autoencoder checkpoint not found: {ae_checkpoint_path}. "
+                    "Copy the AE checkpoint with the model or set autoencoder.checkpoint_path."
+                )
+            autoencoder_checkpoint_loaded = True
         autoencoder = AutoencoderBackend(
             backend=ae_saved.get("backend", "local"),
             pretrained_model_name_or_path=ae_saved.get("pretrained_model_name_or_path"),
@@ -136,11 +182,26 @@ def sample(args: argparse.Namespace) -> None:
             scaling_factor=ae_saved.get("scaling_factor", 1.0),
             freeze=True,
             base_channels=ae_saved.get("base_channels", 64),
+            checkpoint_path=ae_checkpoint_path,
+            require_latent_stats=bool(ae_saved.get("require_latent_stats", False)),
         ).to(device)
         ae_latent_channels = ae_saved["latent_channels"]
         ae_latent_size = ae_saved["latent_size"]
     else:
         ae_cfg = cfg["autoencoder"]
+        ae_checkpoint_path = ae_cfg.get("checkpoint_path")
+        if ae_cfg.get("backend", "local") == "local":
+            if not ae_checkpoint_path:
+                raise FileNotFoundError(
+                    "Config uses backend='local' but autoencoder.checkpoint_path is unset. "
+                    "Refusing to sample with a randomly initialised autoencoder."
+                )
+            if not Path(ae_checkpoint_path).expanduser().is_file():
+                raise FileNotFoundError(
+                    f"Local autoencoder checkpoint not found: {ae_checkpoint_path}. "
+                    "Pretrain it first with `python -m scripts.traceflow train-autoencoder`."
+                )
+            autoencoder_checkpoint_loaded = True
         autoencoder = AutoencoderBackend(
             backend=ae_cfg.get("backend", "local"),
             pretrained_model_name_or_path=ae_cfg.get("pretrained_model_name_or_path"),
@@ -150,11 +211,15 @@ def sample(args: argparse.Namespace) -> None:
             scaling_factor=ae_cfg.get("scaling_factor", 1.0),
             freeze=True,
             base_channels=ae_cfg.get("base_channels", 64),
+            checkpoint_path=ae_checkpoint_path,
+            require_latent_stats=bool(ae_cfg.get("require_latent_stats", False)),
         ).to(device)
         ae_latent_channels = ae_cfg["latent_channels"]
         ae_latent_size = ae_cfg["latent_size"]
 
     autoencoder.eval()
+    if autoencoder_checkpoint_loaded:
+        print(f"[sample] Loaded local autoencoder checkpoint: {ae_checkpoint_path}")
 
     # ------------------------------------------------------------------
     # 4. FlowTransformer (built from checkpoint's saved architecture)
@@ -179,12 +244,13 @@ def sample(args: argparse.Namespace) -> None:
         dropout=0.0,
         class_conditional=m_cfg.get("class_conditional", False),
         num_classes=m_cfg.get("num_classes"),
+        time_scale=m_cfg.get("time_scale", 1.0),
     ).to(device)
 
     # ------------------------------------------------------------------
     # 5. Load weights
     # ------------------------------------------------------------------
-    if use_ema and "ema_model" in state:
+    if requested_ema and "ema_model" in state:
         print("[sample] Using EMA weights.")
         ema_state = state["ema_model"]
         model_state = model.state_dict()
@@ -192,17 +258,22 @@ def sample(args: argparse.Namespace) -> None:
             if param.requires_grad and name in ema_state:
                 model_state[name] = ema_state[name].to(device)
         model.load_state_dict(model_state)
+        used_ema = True
     else:
+        if requested_ema:
+            print("[sample] WARNING: --no-ema was not set, but checkpoint has no ema_model; using raw weights.")
         model.load_state_dict(state["model"])
 
     model.eval()
     print(f"[sample] Model loaded. Generating {num_samples} samples | "
-          f"sampler={sampler} | steps={steps}")
+          f"sampler={sampler} | steps={steps} | guidance_scale={guidance_scale:.3f}")
 
     # Optional class conditioning, matching DiT/SiT ImageNet-style training.
     y = None
+    sample_num_classes = None
     if m_cfg.get("class_conditional", False):
         num_classes = int(m_cfg.get("num_classes") or cfg.get("model", {}).get("num_classes") or 1000)
+        sample_num_classes = num_classes
         if args.class_id is not None:
             if args.class_id < 0 or args.class_id >= num_classes:
                 raise ValueError(f"--class-id must be in [0, {num_classes - 1}], got {args.class_id}")
@@ -223,9 +294,25 @@ def sample(args: argparse.Namespace) -> None:
 
     with torch.no_grad():
         if sampler == "heun":
-            z0_k = sample_heun(model, latent_shape, steps, device, y=y)
+            z0_k = sample_heun(
+                model,
+                latent_shape,
+                steps,
+                device,
+                y=y,
+                guidance_scale=guidance_scale,
+                num_classes=sample_num_classes,
+            )
         else:
-            z0_k = sample_euler(model, latent_shape, steps, device, y=y)
+            z0_k = sample_euler(
+                model,
+                latent_shape,
+                steps,
+                device,
+                y=y,
+                guidance_scale=guidance_scale,
+                num_classes=sample_num_classes,
+            )
 
         # Defender-side inversion: z_0_k → z_0 (AE latent space).
         # For identity transform this is a no-op; for keyed it undoes the key rotation.
@@ -370,11 +457,16 @@ def sample(args: argparse.Namespace) -> None:
         "checkpoint": args.checkpoint,
         "sampler": sampler,
         "steps": steps,
+        "guidance_scale": guidance_scale,
         "num_samples": num_samples,
         "seed": seed,
-        "use_ema": use_ema,
+        "requested_ema": requested_ema,
+        "use_ema": used_ema,
         "device": str(device),
         "latent_shape": list(latent_shape),
+        "autoencoder_checkpoint": ae_checkpoint_path,
+        "autoencoder_checkpoint_loaded": autoencoder_checkpoint_loaded,
+        "autoencoder_latent_stats": autoencoder.latent_stats_metadata() if hasattr(autoencoder, "latent_stats_metadata") else {},
         "model_cfg": m_cfg,
         "transform_type": transform_type,
         "class_labels": None if y is None else y.detach().cpu().tolist(),
@@ -401,6 +493,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=None, help="RNG seed for reproducible samples.")
     parser.add_argument("--class-id", type=int, default=None, help="Fixed class label for class-conditional checkpoints. Defaults to random labels.")
+    parser.add_argument("--guidance-scale", type=float, default=None, help="Classifier-free guidance scale. Defaults to config sampling.guidance_scale or 1.0.")
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--no-ema", action="store_true", help="Do not use EMA weights.")
     return parser.parse_args()

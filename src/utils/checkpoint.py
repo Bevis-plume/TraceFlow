@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import copy
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Iterator, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -68,6 +69,12 @@ class EMAModel:
     def __init__(self, model: nn.Module, decay: float = 0.9999) -> None:
         self.decay = decay
         self.shadow: Dict[str, torch.Tensor] = {}
+        self._model = model
+        # Number of EMA updates applied. Used for decay warmup so the average is
+        # not dominated by the (near-zero, zero-init) model at the start of
+        # training. Without this, short/medium runs produce a heavily damped EMA
+        # whose velocity field cannot denoise pure noise during sampling.
+        self.num_updates = 0
         self._register(model)
 
     def _register(self, model: nn.Module) -> None:
@@ -75,13 +82,26 @@ class EMAModel:
             if param.requires_grad:
                 self.shadow[name] = param.data.clone().float()
 
+    def _effective_decay(self) -> float:
+        """Warmup-clamped decay: min(decay, (1 + n) / (10 + n)).
+
+        Early on (small n) the effective decay is small so the EMA tracks the
+        model closely; it approaches ``self.decay`` as training progresses. This
+        is the standard diffusion/DiT EMA warmup and is essential for runs that
+        are not millions of steps long.
+        """
+        warmup = (1.0 + self.num_updates) / (10.0 + self.num_updates)
+        return min(self.decay, warmup)
+
     @torch.no_grad()
     def update(self, model: nn.Module) -> None:
+        self.num_updates += 1
+        decay = self._effective_decay()
         for name, param in model.named_parameters():
             if param.requires_grad and name in self.shadow:
                 self.shadow[name] = (
-                    self.decay * self.shadow[name]
-                    + (1.0 - self.decay) * param.data.float()
+                    decay * self.shadow[name]
+                    + (1.0 - decay) * param.data.float()
                 )
 
     def state_dict(self) -> Dict[str, torch.Tensor]:
@@ -95,3 +115,25 @@ class EMAModel:
         for name, param in model.named_parameters():
             if param.requires_grad and name in self.shadow:
                 param.data.copy_(self.shadow[name].to(param.device))
+
+    @contextmanager
+    def average_parameters(self, model: Optional[nn.Module] = None) -> Iterator[None]:
+        """Temporarily swap EMA parameters into ``model`` and restore raw weights.
+
+        Sampling/evaluation should use this context so short runs do not report
+        raw, non-averaged weights while checkpoints still preserve both states.
+        """
+        target = model or self._model
+        backup: Dict[str, torch.Tensor] = {}
+        with torch.no_grad():
+            for name, param in target.named_parameters():
+                if param.requires_grad and name in self.shadow:
+                    backup[name] = param.data.clone()
+            self.copy_to(target)
+        try:
+            yield
+        finally:
+            with torch.no_grad():
+                for name, param in target.named_parameters():
+                    if name in backup:
+                        param.data.copy_(backup[name].to(param.device))

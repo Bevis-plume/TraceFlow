@@ -31,6 +31,7 @@ where θ are the FlowTransformer parameters.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -552,4 +553,154 @@ def pixel_inversion_attack(
         "final_gml": gml_history[-1] if gml_history else float("nan"),
         "attacker": attacker,
         "snapshots": snapshots,
+    }
+
+
+def _total_variation(x: torch.Tensor) -> torch.Tensor:
+    """Anisotropic TV prior used by strong pixel inversion attacks."""
+    dh = (x[:, :, 1:, :] - x[:, :, :-1, :]).abs().mean()
+    dw = (x[:, :, :, 1:] - x[:, :, :, :-1]).abs().mean()
+    return dh + dw
+
+
+def _high_frequency_prior(x: torch.Tensor) -> torch.Tensor:
+    """Small smoothness prior that discourages checkerboard solutions."""
+    lap = -4.0 * x
+    lap = lap + F.pad(x[:, :, 1:, :], (0, 0, 0, 1))
+    lap = lap + F.pad(x[:, :, :-1, :], (0, 0, 1, 0))
+    lap = lap + F.pad(x[:, :, :, 1:], (0, 1, 0, 0))
+    lap = lap + F.pad(x[:, :, :, :-1], (1, 0, 0, 0))
+    return lap.pow(2).mean()
+
+
+def geiping_pixel_inversion_attack(
+    model: nn.Module,
+    autoencoder: Any,
+    watermark_modules: Optional[Dict[str, Any]],
+    target_grads: List[Optional[torch.Tensor]],
+    x_shape: Tuple[int, int, int, int],
+    attack_state: AttackBatchState,
+    steps: int = 1000,
+    lr: float = 0.08,
+    device: torch.device = torch.device("cpu"),
+    log_interval: int = 100,
+    attacker: str = "no_key",
+    latent_transform: Optional[Any] = None,
+    snapshot_steps: Optional[Sequence[int]] = None,
+    restarts: int = 4,
+    tv_weight: float = 1.0e-4,
+    l2_weight: float = 1.0e-5,
+    frequency_weight: float = 1.0e-5,
+) -> Dict[str, Any]:
+    """Geiping-style strong pixel inversion with priors and multi-start search.
+
+    This keeps the same cosine gradient-matching objective as the lightweight
+    pixel attack, but optimises an unconstrained variable through ``tanh``, adds
+    weak natural-image priors, and runs several independent restarts.  The final
+    output is the best restart by final gradient-matching loss; per-restart
+    summaries are returned so papers can report best and median attack strength.
+    """
+    if restarts <= 0:
+        raise ValueError(f"restarts must be positive, got {restarts}.")
+
+    dummy_transform = _resolve_attacker_transform(attacker, latent_transform)
+    attack_state = attack_state.to(device)
+    model_params = list(model.parameters())
+    snapshot_set = {int(s) for s in (snapshot_steps or []) if int(s) > 0}
+
+    was_training = model.training
+    model.eval()
+    for m in _wm_modules_list(watermark_modules):
+        m.eval()
+
+    best: Optional[Dict[str, Any]] = None
+    restart_summaries: List[Dict[str, Any]] = []
+
+    try:
+        for restart_idx in range(restarts):
+            with torch.no_grad():
+                x0 = torch.empty(*x_shape, device=device).uniform_(-0.9, 0.9)
+                if restart_idx % 3 == 1:
+                    x0.mul_(0.25)
+                elif restart_idx % 3 == 2:
+                    x0.normal_(mean=0.0, std=0.35).clamp_(-0.95, 0.95)
+                u0 = torch.atanh(x0.clamp(-0.999, 0.999))
+            u = u0.detach().clone().requires_grad_(True)
+            optimizer = torch.optim.Adam([u], lr=lr)
+            gml_history: List[float] = []
+            local_snapshots: Dict[int, torch.Tensor] = {}
+
+            for step in range(steps):
+                step_lr = lr * 0.5 * (1.0 + math.cos(math.pi * step / max(steps, 1)))
+                for group in optimizer.param_groups:
+                    group["lr"] = step_lr
+                optimizer.zero_grad()
+
+                x_dummy = torch.tanh(u)
+                z_dummy = autoencoder.encode_with_grad(x_dummy)
+                loss = _traceflow_loss_from_latent(
+                    model, autoencoder, dummy_transform, watermark_modules, z_dummy,
+                    t=attack_state.t, eps=attack_state.eps, bits=attack_state.bits, y=attack_state.y,
+                )
+                dummy_grads = _model_param_grads(loss, model_params)
+                gml = gradient_matching_loss(dummy_grads, target_grads)
+                prior = (
+                    tv_weight * _total_variation(x_dummy)
+                    + l2_weight * x_dummy.pow(2).mean()
+                    + frequency_weight * _high_frequency_prior(x_dummy)
+                )
+                attack_loss = gml + prior
+                attack_loss.backward()
+                optimizer.step()
+
+                gml_val = gml.item()
+                gml_history.append(gml_val)
+                if (step + 1) in snapshot_set:
+                    local_snapshots[step + 1] = x_dummy.detach().cpu()
+                if log_interval > 0 and (step + 1) % log_interval == 0:
+                    print(
+                        f"  [geiping_pixel:{attacker}:r{restart_idx+1}/{restarts}] "
+                        f"step={step+1:4d}  gml={gml_val:.6f} prior={prior.item():.6f}"
+                    )
+
+            final_gml = gml_history[-1] if gml_history else float("nan")
+            x_final = torch.tanh(u).detach()
+            summary = {
+                "restart": restart_idx,
+                "final_gml": final_gml,
+                "best_gml": min(gml_history) if gml_history else float("nan"),
+                "steps": steps,
+            }
+            restart_summaries.append(summary)
+            if best is None or final_gml < best["final_gml"]:
+                best = {
+                    "x_dummy": x_final,
+                    "gml_history": gml_history,
+                    "final_gml": final_gml,
+                    "snapshots": local_snapshots,
+                    "best_restart": restart_idx,
+                }
+    finally:
+        if was_training:
+            model.train()
+
+    assert best is not None
+    final_values = sorted(float(r["final_gml"]) for r in restart_summaries)
+    median_gml = final_values[len(final_values) // 2]
+    return {
+        "x_dummy": best["x_dummy"],
+        "gml_history": best["gml_history"],
+        "final_gml": best["final_gml"],
+        "median_final_gml": median_gml,
+        "best_restart": best["best_restart"],
+        "restart_summaries": restart_summaries,
+        "attacker": attacker,
+        "attack_method": "geiping_pixel",
+        "snapshots": best["snapshots"],
+        "priors": {
+            "tv_weight": tv_weight,
+            "l2_weight": l2_weight,
+            "frequency_weight": frequency_weight,
+            "restarts": restarts,
+        },
     }

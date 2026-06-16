@@ -1,0 +1,342 @@
+# TraceFlow CIFAR-10 32x32 single-file configuration (latent-16 VAE paper rerun).
+# ---------------------------------------------------------------------------
+# Goal priority for this config:
+#   1. Image quality first (native CIFAR-10 32x32, pretrained local AE).
+#   2. Watermark traceability second (rebalanced, image quality is primary).
+#   3. No-key inversion resistance third.
+#
+# Hardware target: a single NVIDIA RTX 5090 (32GB). Batch sizes and eval
+# settings are chosen to stay safely within 32GB and avoid OOM. This does NOT
+# assume 96GB anymore.
+#
+# Two run sizes (see docs/CIFAR32_PAPER_RUNBOOK.md):
+#   - pilot:  ~10k steps       (mechanism validation; use --set training.num_steps=10000)
+#   - paper:  50k default      (resumable to 100k with --set training.num_steps=100000 --resume ...)
+#
+# Paper default: local VAE compresses CIFAR-10 32x32 images to 4x16x16 latents.
+# With patch_size=2 this gives 8x8=64 DiT tokens, versus the failed latent-32
+# pilot's 16x16=256 tokens. This is the main CIFAR32 line; do not reuse old
+# cifar32/latent-32 checkpoints with this config.
+# ---------------------------------------------------------------------------
+
+traceflow:
+  name: traceflow
+  mode: full                 # smoke | full
+  output_dir: results/traceflow_cifar32_lat16_vae
+  figures: true
+  readiness: true
+  training_figures: true
+
+naming:
+  project: traceflow
+  dataset_tag: cifar32_lat16_vae
+  budget_tag: paper
+  templates:
+    check_ready: "{project}-{dataset}-preflight"
+    diagnose_data: "{project}-{dataset}-data-diagnosis"
+    train_autoencoder: "{project}-{dataset}-autoencoder"
+    train_generator: "{project}-{dataset}-generator"
+    train_keyed: "{project}-{dataset}-keyed"
+    train_identity: "{project}-{dataset}-identity"
+    train_final: "{project}-{dataset}-final"
+    run_all: "{project}-{dataset}-paper-all"
+    eval_all: "{project}-{dataset}-paper-eval"
+    exp01: "{project}-{dataset}-exp01-baseline"
+    exp02: "{project}-{dataset}-exp02-keyed"
+    exp03: "{project}-{dataset}-exp03-identity"
+    exp04: "{project}-{dataset}-exp04-traceflow"
+    exp05: "{project}-{dataset}-exp05-robustness"
+
+artifact_bundle:
+  # Output bundles are clearly separated from the old 256 run.
+  root: runs/{project}-{dataset}
+
+assets:
+  data_dir: data
+  weights_dir: weights
+  dataset:
+    name: cifar10
+    root: data
+    min_size_mb: 0
+  metric_weights:
+    enabled: true
+    torch_home: weights/torch
+    hf_home: weights/huggingface
+
+runtime:
+  detach_default: false
+  make_archive: false
+
+hardware:
+  profile: rtx_5090_32gb
+
+run_all:
+  train_policy: missing       # missing | always
+  force_train: false
+  reuse_within_bundle: true
+  diagnose_data: true
+  oom_retry: true             # full TraceFlow micro-batch fallback on CUDA OOM
+
+# Optional project-local checkpoint registry for eval-all.
+checkpoints:
+  generator: checkpoints/reuse/generator/latest.pt
+  traceflow: checkpoints/reuse/traceflow/latest.pt
+  keyed: checkpoints/reuse/keyed/latest.pt
+  traceflow_identity: checkpoints/reuse/identity/latest.pt
+
+evaluation:
+  train_missing: false
+  attack_steps: 100
+  require_traceflow_checkpoint: true
+  allow_skipped_ablations: true
+
+entries:
+  check_ready: {}
+  train_autoencoder: {}
+  train_generator: {}
+  train_keyed:
+    overrides:
+      training:
+        batch_size: 128
+        grad_accum_steps: 1
+  train_identity:
+    # Watermark path is heavier (decode/re-encode + adapter + dual detectors).
+    overrides:
+      training:
+        batch_size: 64
+        grad_accum_steps: 1
+  train_final:
+    # Full TraceFlow: keyed + watermark. Warm-started from the baseline
+    # generator by run-all to protect image quality. Conservative 32GB batch.
+    overrides:
+      training:
+        batch_size: 48
+        grad_accum_steps: 1
+  run_all:
+    overrides:
+      training:
+        mixed_precision: bf16
+  eval_all: {}
+
+project:
+  name: traceflow
+  seed: 42
+  device: cuda               # use auto for local smoke on Mac/CPU
+  output_dir: outputs/flow_transformer_cifar32_lat16_vae
+
+data:
+  name: cifar10              # native CIFAR-10 32x32
+  root: data
+  image_size: 32
+  num_workers: 8             # reasonable for a single workstation/server
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 4
+  download: true             # server run: download/extract CIFAR-10 on the 5090 machine
+
+autoencoder:
+  # Local project-native VAE. NOT the SD/diffusers VAE for CIFAR.
+  # Pretrain it first; the checkpoint is loaded (and kept frozen) for all
+  # downstream TraceFlow training. latent_size=16 is the paper default: enough
+  # compression to make CIFAR generation learnable/fast while keeping AE
+  # reconstruction high quality.
+  backend: local
+  kind: vae
+  pretrained_model_name_or_path: null
+  checkpoint_path: checkpoints/cifar32_lat16_vae_ae/latest.pt
+  require_latent_stats: true # fail fast if AE was trained by an older script without latent stats
+  # Directly decoding z~N(0,I) is expected to look like noise for a flow/diffusion
+  # latent model; the generator must denoise the prior before decode. Keep prior
+  # grids as diagnostics, but do not gate training on them.
+  require_prior_diagnostics: false
+  min_prior_decode_pixel_std: 0.02
+  freeze: true               # frozen during TraceFlow training (pretrained separately)
+  latent_channels: 4
+  latent_size: 16
+  scaling_factor: 1.0
+  base_channels: 128
+
+autoencoder_pretrain:
+  # Used by `python -m scripts.traceflow train-autoencoder` /
+  # `python -m scripts.pretrain_autoencoder`.
+  num_steps: 20000
+  batch_size: 128
+  learning_rate: 2.0e-4
+  weight_decay: 0.0
+  warmup_steps: 500
+  lambda_latent_reg: 0.0     # do not collapse latents toward zero
+  lambda_latent_dist: 0.0     # VAE KL handles sampleable prior; keep aggregate penalty off
+  kl_weight: 5.0e-4           # stronger prior alignment; recon remains protected by warmup + mu recon
+  kl_warmup_steps: 8000
+  free_bits: 0.005
+  mu_recon_weight: 0.25       # posterior-sample recon + 0.25 * deterministic mu recon
+  mixed_precision: bf16
+  log_interval: 100
+  sample_interval: 1000
+  save_interval: 2000
+  latent_stats_batches: 64   # estimate per-channel latent mean/std for sampleable flow latents
+  num_workers: 8
+
+model:
+  preset: DiT-S
+  latent_channels: 4
+  latent_size: 16
+  patch_size: 2              # 16/2 = 8x8 = 64 tokens
+  # Critical for rectified-flow learning: DiT sinusoidal embeddings need
+  # timestep-like magnitudes; t in [0,1] directly is almost constant.
+  time_scale: 1000.0
+  hidden_size: 384
+  depth: 12
+  num_heads: 6
+  mlp_ratio: 4.0
+  dropout: 0.0
+  class_conditional: true
+  num_classes: 10            # CIFAR-10
+
+training:
+  # Conservative RTX 5090 32GB defaults. Generator/keyed use this batch; the
+  # heavier watermark paths override to smaller batches in `entries`.
+  batch_size: 128
+  grad_accum_steps: 1
+  num_steps: 50000           # paper default; pilot via --set training.num_steps=10000
+  learning_rate: 1.0e-4
+  weight_decay: 0.0          # match DiT-style generator training; avoids damping sample detail
+  warmup_steps: 2000
+  ema_decay: 0.999       # faster EMA for 10k pilot; avoids severe lag
+  mixed_precision: bf16      # none | bf16 | fp16
+  fused_optimizer: true
+  matmul_precision: high
+  torch_compile: false       # disabled by default for long-run stability
+  clean_fp_interval: 1000
+  log_interval: 50
+  sample_interval: 2000      # dense quality checkpoints; loss alone is not a quality signal
+  save_interval: 10000
+  checkpoint_dir: checkpoints/flow_transformer_cifar32_lat16_vae
+
+flow_matching:
+  # Mainline CIFAR32 generator objective: velocity-only rectified flow with
+  # uniform time sampling. The mixed-high + x0 auxiliary ablation collapsed
+  # high-noise probes toward low-frequency mean/color blocks, so keep it off by
+  # default and use multi-t probes only as diagnostics.
+  t_sampling: uniform
+  high_t_prob: 0.0
+  high_t_min: 0.6
+  x0_loss_weight: 0.0
+  x0_t_power: 1.0
+  velocity_t_weight_scale: 0.0
+  denoise_probe_t_values: [0.5, 0.8, 0.95]
+
+sampling:
+  sampler: euler
+  steps: 100                 # higher-quality evaluation; use --set sampling.steps=50 for fast previews
+  guidance_scale: 3.0       # classifier-free guidance; 1.0 disables guidance
+  num_samples: 16
+
+smoke:
+  image_size: 32
+  batch_size: 2
+  latent_channels: 4
+  latent_size: 16
+  model_preset: DiT-XS
+  steps: 2
+
+security:
+  latent_transform:
+    type: keyed              # exp01/exp03 override this to identity automatically
+    secret_key: tf_cifar32_2b6f0c9e7a1d4f8b3c5e9a0d2f4b6c8e1a3d5f7b9c1e3a5d7f9b1c3e5a7d9f1b
+    block_size: 16
+    block_layout: patch      # align keyed blocks to DiT 2x2x4 patch tokens
+    bias_scale: 0.1
+
+watermark:
+  # Rebalanced so IMAGE QUALITY is primary. Lower watermark strength and loss
+  # weights; higher preservation/invisibility pressure. Robustness is delayed
+  # (disabled) for the first paper run. Target ~0.80-0.90 generated watermark
+  # accuracy; anything clearly above 0.50 is meaningful. Clean false positive
+  # should stay near 0.50.
+  enabled: true              # exp01/exp02 disable this automatically
+  type: traceflow
+  bit_length: 32
+  seed: 1234
+  alpha: 0.04                # lower watermark strength (was 0.10)
+  extractor_hidden_dim: 384
+  adapter_base_channels: 96
+  adapter_num_blocks: 3
+  adapter_max_channels: 384
+  adapter_carrier_strength: 0.5
+  adapter_carrier_grid_size: 32
+  detector_base_channels: 96
+  detector_num_scales: 4
+  detector_num_blocks: 3
+  detector_max_channels: 512
+  detector_carrier_grid_size: 32
+  detector_carrier_weight: 0.10
+  latent_channels: 4
+  latent_detector_hidden_dim: 192
+  latent_detector_base_channels: 96
+  latent_detector_num_blocks: 4
+  latent_detector_max_channels: 384
+  message_mode: random_per_sample
+  # Lower watermark loss weights, higher preservation/invisibility weights.
+  lambda_wm_img: 0.15        # was 0.4
+  lambda_wm_latent: 0.5      # cautious full-TraceFlow pilot; was 4.0, then 1.5
+  lambda_img: 0.15           # preservation up (was 0.05)
+  lambda_cycle: 0.03
+  lambda_residual: 0.002     # invisibility pressure up (was 0.0008)
+  lambda_perceptual: 0.10    # perceptual invisibility up (was 0.05)
+  lambda_frequency: 0.02     # frequency term up (was 0.01)
+  # Robustness delayed/optional for the first paper run.
+  robustness_enabled: false
+  robust_max_views: 1
+  robust_batch_size: 4
+  robust_chunk_size: 2
+  robust_detach_input: true
+  robust_latent_enabled: false
+  lambda_wm_robust: 0.0
+  image_warmup_detach_until: 8000
+  carrier_schedule_enabled: true
+  carrier_schedule_start: 4000
+  carrier_schedule_steps: 10000
+  carrier_schedule_min_scale: 0.05
+  lambda_clean_negative: 0.1
+  clean_negative_batch_size: 4
+  clean_negative_chunk_size: 2
+  # Schedule tuned for a 30k paper run (scaled down from the 256 run).
+  schedule_warmup_steps: 2000
+  schedule_main_steps: 4000
+  schedule_robust_start: 18000
+  schedule_robust_steps: 8000
+  schedule_polish_start: 22000
+  schedule_polish_steps: 8000
+  cycle_target: protected_latent
+  save_bits: true
+  detection_threshold_acc: 0.85   # do not chase 99-100% bit accuracy
+
+experiments:
+  exp01:
+    enabled: true
+    method: baseline
+
+  exp02:
+    enabled: true
+    method: keyed
+
+  exp03:
+    enabled: true
+    method: traceflow_identity
+
+  exp04:
+    enabled: true
+    method: traceflow
+    attack: latent
+    attack_steps: 100
+    attacker: no_key
+
+  exp05:
+    enabled: true
+    method: traceflow
+    attack_steps: 100
+
+postprocess:
+  sample: true
+  training_figures: true

@@ -29,19 +29,79 @@ Sampling (reverse: t goes from 1 → 0)
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Any, Mapping, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 
 
-def sample_t(batch_size: int, device: torch.device) -> torch.Tensor:
-    """Sample continuous time t ~ Uniform(0, 1).
+def _guided_velocity(
+    model: torch.nn.Module,
+    z: torch.Tensor,
+    t: torch.Tensor,
+    y: Optional[torch.Tensor],
+    *,
+    guidance_scale: float = 1.0,
+    num_classes: Optional[int] = None,
+) -> torch.Tensor:
+    """Predict velocity with optional classifier-free guidance.
 
-    Returns:
-        t: (B,) float tensor on `device`.
+    ``LabelEmbedder`` reserves class index ``num_classes`` as the null label.
+    Training already drops labels into that slot; sampling needs to combine the
+    conditional and null predictions explicitly to use the learned CFG branch.
     """
-    return torch.rand(batch_size, device=device)
+    scale = float(guidance_scale)
+    if y is None or num_classes is None or abs(scale - 1.0) < 1e-8:
+        return model(z, t, y)
+
+    null_y = torch.full_like(y, int(num_classes))
+    z_in = torch.cat([z, z], dim=0)
+    t_in = torch.cat([t, t], dim=0)
+    y_in = torch.cat([y, null_y], dim=0)
+    v_cond, v_uncond = model(z_in, t_in, y_in).chunk(2, dim=0)
+    return v_uncond + scale * (v_cond - v_uncond)
+
+
+def sample_t(
+    batch_size: int,
+    device: torch.device,
+    *,
+    strategy: str = "uniform",
+    high_t_prob: float = 0.0,
+    high_t_min: float = 0.6,
+) -> torch.Tensor:
+    """Sample continuous time t in [0, 1].
+
+    ``mixed_high`` keeps part of each batch in the high-noise regime. This
+    prevents the model from minimizing the easy low/mid-t denoising objective
+    while failing to learn the structure-forming velocity near t=1.
+    """
+    strategy = str(strategy or "uniform")
+    if strategy == "uniform":
+        return torch.rand(batch_size, device=device)
+    if strategy != "mixed_high":
+        raise ValueError(f"Unknown flow t_sampling strategy {strategy!r}")
+
+    high_t_prob = float(max(0.0, min(1.0, high_t_prob)))
+    high_t_min = float(max(0.0, min(1.0, high_t_min)))
+    t = torch.rand(batch_size, device=device)
+    if high_t_prob <= 0.0:
+        return t
+    high_mask = torch.rand(batch_size, device=device) < high_t_prob
+    high = high_t_min + (1.0 - high_t_min) * torch.rand(batch_size, device=device)
+    return torch.where(high_mask, high, t)
+
+
+def _flow_options(flow_cfg: Optional[Mapping[str, Any]]) -> dict[str, float | str]:
+    cfg = dict(flow_cfg or {})
+    return {
+        "t_sampling": str(cfg.get("t_sampling", "uniform")),
+        "high_t_prob": float(cfg.get("high_t_prob", 0.0)),
+        "high_t_min": float(cfg.get("high_t_min", 0.6)),
+        "x0_loss_weight": float(cfg.get("x0_loss_weight", 0.0)),
+        "x0_t_power": float(cfg.get("x0_t_power", 1.0)),
+        "velocity_t_weight_scale": float(cfg.get("velocity_t_weight_scale", 0.0)),
+    }
 
 
 def interpolate(
@@ -85,31 +145,10 @@ def flow_loss(
     model: torch.nn.Module,
     z: torch.Tensor,
     y: Optional[torch.Tensor] = None,
+    flow_cfg: Optional[Mapping[str, Any]] = None,
 ) -> torch.Tensor:
-    """Compute rectified flow training loss.
-
-    Samples t ~ Uniform(0,1), eps ~ N(0,I), and computes
-    MSE between predicted and target velocity.
-
-    Args:
-        model: FlowTransformer (or any module with forward(z_t, t, y) -> v).
-        z:     Clean latent batch (B, C, H, W).
-        y:     Optional class labels (B,).
-
-    Returns:
-        loss: Scalar MSE loss.
-    """
-    B = z.shape[0]
-    device = z.device
-
-    eps = torch.randn_like(z)
-    t = sample_t(B, device)
-
-    z_t = interpolate(z, eps, t)
-    v_target = target_velocity(z, eps)
-
-    v_pred = model(z_t, t, y)
-    return F.mse_loss(v_pred, v_target)
+    """Compute rectified flow training loss."""
+    return flow_loss_with_state(model, z, y=y, flow_cfg=flow_cfg)["loss"]
 
 
 def flow_loss_with_state(
@@ -118,44 +157,18 @@ def flow_loss_with_state(
     y: Optional[torch.Tensor] = None,
     t: Optional[torch.Tensor] = None,
     eps: Optional[torch.Tensor] = None,
+    flow_cfg: Optional[Mapping[str, Any]] = None,
 ) -> dict:
-    """Compute rectified flow training loss and return intermediate state.
+    """Compute rectified flow loss and return intermediate state.
 
-    Same as flow_loss but returns a dict with all intermediate tensors for
-    use in gradient-enabled training paths (e.g. TraceFlow).
-
-    Determinism
-    -----------
-    ``t`` and ``eps`` may be supplied explicitly so that the *same* noise/time
-    realisation can be reused across multiple calls.  This is essential for the
-    inversion evaluation harness: target and dummy gradients must be computed
-    under an identical ``(t, eps)`` realisation, otherwise the gradient-matching
-    objective compares apples to oranges.
-
-    - If ``t`` is provided it is used exactly (moved to ``z``'s device).
-    - If ``eps`` is provided it is used exactly (moved to ``z``'s device).
-    - If either is ``None`` it is freshly sampled (original behaviour).
-
-    Args:
-        model: FlowTransformer (or any module with forward(z_t, t, y) -> v).
-        z:     Clean latent batch (B, C, H, W).
-        y:     Optional class labels (B,).
-        t:     Optional fixed time values (B,).  Sampled if ``None``.
-        eps:   Optional fixed noise (B, C, H, W).  Sampled if ``None``.
-
-    Returns:
-        dict with keys:
-            loss:     Scalar MSE loss.
-            z_t:      Noisy latent at time t  (B, C, H, W).
-            t:        Time values used         (B,).
-            eps:      Noise used               (B, C, H, W).
-            v_pred:   Predicted velocity       (B, C, H, W).
-            v_target: Target velocity          (B, C, H, W).
-            z_hat:    Estimated clean latent   (B, C, H, W).
-                      z_hat = z_t - t * v_pred  (rectified-flow denoising estimate).
+    If ``flow_cfg`` is omitted, this keeps the original velocity-only uniform-t
+    objective. Passing ``flow_cfg`` enables high-noise t sampling, velocity
+    weighting, and optional x0/clean-latent supervision. Explicit ``t`` and
+    ``eps`` are still honored exactly for inversion-gradient determinism.
     """
     B = z.shape[0]
     device = z.device
+    opts = _flow_options(flow_cfg)
 
     if eps is None:
         eps = torch.randn_like(z)
@@ -163,20 +176,42 @@ def flow_loss_with_state(
         eps = eps.to(device=device, dtype=z.dtype)
 
     if t is None:
-        t = sample_t(B, device)
+        t = sample_t(
+            B,
+            device,
+            strategy=str(opts["t_sampling"]),
+            high_t_prob=float(opts["high_t_prob"]),
+            high_t_min=float(opts["high_t_min"]),
+        )
     else:
         t = t.to(device=device, dtype=z.dtype)
 
     z_t = interpolate(z, eps, t)
     v_target = target_velocity(z, eps)
-
     v_pred = model(z_t, t, y)
-    loss = F.mse_loss(v_pred, v_target)
+
+    reduce_dims = tuple(range(1, v_pred.ndim))
+    velocity_per = (v_pred - v_target).pow(2).mean(dim=reduce_dims)
+    velocity_weight = 1.0 + float(opts["velocity_t_weight_scale"]) * t.float()
+    loss_velocity = (velocity_per * velocity_weight).mean() / velocity_weight.mean().detach().clamp_min(1e-6)
 
     z_hat = z_t - t.view(B, 1, 1, 1) * v_pred
+    x0_per = (z_hat - z).pow(2).mean(dim=reduce_dims)
+    x0_weight = float(opts["x0_loss_weight"]) * t.float().clamp_min(0.0).pow(float(opts["x0_t_power"]))
+    loss_x0 = (x0_per * x0_weight).mean()
+    loss = loss_velocity + loss_x0
+
+    high_t_min = float(opts["high_t_min"])
+    high_t_fraction = (t.float() >= high_t_min).float().mean()
 
     return {
         "loss": loss,
+        "loss_velocity": loss_velocity,
+        "loss_velocity_raw": velocity_per.mean(),
+        "loss_x0": loss_x0,
+        "loss_x0_raw": x0_per.mean(),
+        "t_mean": t.float().mean(),
+        "high_t_fraction": high_t_fraction,
         "z_t": z_t,
         "t": t,
         "eps": eps,
@@ -193,6 +228,8 @@ def sample_euler(
     steps: int,
     device: torch.device,
     y: Optional[torch.Tensor] = None,
+    guidance_scale: float = 1.0,
+    num_classes: Optional[int] = None,
 ) -> torch.Tensor:
     """Generate samples using the Euler integrator.
 
@@ -209,6 +246,8 @@ def sample_euler(
         steps:        Number of Euler steps (higher = better quality).
         device:       Target device.
         y:            Optional class labels (B,).
+        guidance_scale: Classifier-free guidance scale. 1.0 preserves old behavior.
+        num_classes:  Number of real classes; the null label is this index.
 
     Returns:
         z_0: Estimated clean latent (B, C, H, W).
@@ -225,7 +264,14 @@ def sample_euler(
     for i in range(steps):
         t_val = 1.0 - i * dt        # t: 1 → dt
         t = torch.full((B,), t_val, device=device, dtype=torch.float32)
-        v = model(z, t, y)          # predicted dz/dt (forward direction)
+        v = _guided_velocity(
+            model,
+            z,
+            t,
+            y,
+            guidance_scale=guidance_scale,
+            num_classes=num_classes,
+        )                           # predicted dz/dt (forward direction)
         z = z - dt * v              # reverse step: move against forward direction
 
     return z
@@ -238,6 +284,8 @@ def sample_euler_trajectory(
     steps: int,
     device: torch.device,
     y: Optional[torch.Tensor] = None,
+    guidance_scale: float = 1.0,
+    num_classes: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Generate samples and keep the latent trajectory.
 
@@ -255,7 +303,14 @@ def sample_euler_trajectory(
     for i in range(steps):
         t_val = 1.0 - i * dt
         t = torch.full((B,), t_val, device=device, dtype=torch.float32)
-        v = model(z, t, y)
+        v = _guided_velocity(
+            model,
+            z,
+            t,
+            y,
+            guidance_scale=guidance_scale,
+            num_classes=num_classes,
+        )
         z = z - dt * v
         traj.append(z.detach().cpu())
     return z, torch.stack(traj, dim=0)
@@ -268,6 +323,8 @@ def sample_heun(
     steps: int,
     device: torch.device,
     y: Optional[torch.Tensor] = None,
+    guidance_scale: float = 1.0,
+    num_classes: Optional[int] = None,
 ) -> torch.Tensor:
     """Generate samples using the Heun (2nd-order Runge-Kutta) integrator.
 
@@ -277,6 +334,8 @@ def sample_heun(
         steps:        Number of Heun steps.
         device:       Target device.
         y:            Optional class labels (B,).
+        guidance_scale: Classifier-free guidance scale. 1.0 preserves old behavior.
+        num_classes:  Number of real classes; the null label is this index.
 
     Returns:
         z_0: Generated clean latent (B, C, H, W).
@@ -293,9 +352,23 @@ def sample_heun(
         t = torch.full((B,), t_val, device=device, dtype=torch.float32)
         t_next = torch.full((B,), max(t_next_val, 0.0), device=device, dtype=torch.float32)
 
-        vel_start = model(z, t, y)
+        vel_start = _guided_velocity(
+            model,
+            z,
+            t,
+            y,
+            guidance_scale=guidance_scale,
+            num_classes=num_classes,
+        )
         z_pred = z - dt * vel_start
-        vel_end = model(z_pred, t_next, y)
+        vel_end = _guided_velocity(
+            model,
+            z_pred,
+            t_next,
+            y,
+            guidance_scale=guidance_scale,
+            num_classes=num_classes,
+        )
         z = z - dt * 0.5 * (vel_start + vel_end)
 
     return z

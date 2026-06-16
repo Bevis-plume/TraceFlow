@@ -10,6 +10,7 @@ and reported as warnings when missing.
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -57,11 +58,34 @@ def ms_ssim_01(a: torch.Tensor, b: torch.Tensor, levels: int = 4) -> float:
     return torch.stack(vals).mean().item()
 
 
+def _torchvision_alexnet_cached() -> bool:
+    """Return True when torchvision's AlexNet weights are already local.
+
+    LPIPS(alex) constructs a torchvision AlexNet and will otherwise download a
+    233MB checkpoint. TraceFlow smoke/offline runs must never trigger that
+    implicitly; set TRACEFLOW_ALLOW_METRIC_DOWNLOADS=1 to opt in.
+    """
+    if os.environ.get("TRACEFLOW_ALLOW_METRIC_DOWNLOADS") == "1":
+        return True
+    candidates = []
+    try:
+        candidates.append(Path(torch.hub.get_dir()) / "checkpoints" / "alexnet-owt-7be5be79.pth")
+    except Exception:
+        pass
+    torch_home = os.environ.get("TORCH_HOME")
+    if torch_home:
+        candidates.append(Path(torch_home) / "hub" / "checkpoints" / "alexnet-owt-7be5be79.pth")
+    candidates.append(Path.home() / ".cache" / "torch" / "hub" / "checkpoints" / "alexnet-owt-7be5be79.pth")
+    return any(path.is_file() for path in candidates)
+
+
 @lru_cache(maxsize=2)
 def _lpips_model(net: str = "alex", device: str = "cpu"):
     try:
         import lpips  # type: ignore
     except Exception:
+        return None
+    if net == "alex" and not _torchvision_alexnet_cached():
         return None
     model = lpips.LPIPS(net=net)
     model.eval()
