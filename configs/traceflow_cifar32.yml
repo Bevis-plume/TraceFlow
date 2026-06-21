@@ -249,6 +249,23 @@ security:
     bias_scale: 0.1
 
 watermark:
+  # Optional forensic mode: train separate detectors so only raw no-key
+  # inversion artifacts are trace-positive; clean CIFAR/AE/generated images
+  # should stay near chance. Legacy joint training ignores these keys unless
+  # scripts/train_inversion_trace_detector.py is used.
+  objective: inversion_trace
+  trace_message_mode: fixed_owner
+  lambda_trace_img: 1.0
+  lambda_trace_latent: 1.0
+  lambda_trace_clean_negative: 2.0
+  trace_positive_source: inversion_outputs
+  trace_negative_sources:
+    - cifar_input
+    - ae_recon
+    - clean_generated
+    - defender_clean
+  trace_clean_fp_target: 0.55
+
   # Rebalanced so IMAGE QUALITY is primary. Lower watermark strength and loss
   # weights; higher preservation/invisibility pressure. Robustness is delayed
   # (disabled) for the first paper run. Target ~0.80-0.90 generated watermark

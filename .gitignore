@@ -38,8 +38,10 @@ references/
 
 local_configs/
 PAPER_FIGURES/
+PAPER_RESULT_PACKAGE/
 
 logs/
+
 
 # Local model assets and generated reports
 /pretrained/

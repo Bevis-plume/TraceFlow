@@ -2336,6 +2336,60 @@ def _add_common_entry_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--set", dest="set_overrides", action="append", default=[], help="Dotted override, e.g. training.num_steps=20000")
 
 
+
+def _build_inversion_trace_dataset(args: argparse.Namespace) -> int:
+    cmd = _python_module_cmd("scripts.build_inversion_trace_dataset")
+    cmd.extend(["--output-dir", args.output_dir])
+    for value in args.inversion_run_dir or []:
+        cmd.extend(["--inversion-run-dir", value])
+    for value in args.positive_dir or []:
+        cmd.extend(["--positive-dir", value])
+    cmd.extend(["--pattern", args.pattern, "--tile-size", str(args.tile_size)])
+    if args.split_grids:
+        cmd.append("--split-grids")
+    if args.max_images:
+        cmd.extend(["--max-images", str(args.max_images)])
+    return _run(cmd)
+
+
+def _train_inversion_trace_detector(args: argparse.Namespace) -> int:
+    cmd = _python_module_cmd("scripts.train_inversion_trace_detector")
+    cmd.extend([
+        "--config", args.config,
+        "--positive-dir", args.positive_dir,
+        "--output-dir", args.output_dir,
+        "--device", args.device,
+        "--steps", str(args.steps),
+        "--batch-size", str(args.batch_size),
+        "--learning-rate", str(args.learning_rate),
+        "--num-workers", str(args.num_workers),
+        "--log-interval", str(args.log_interval),
+        "--save-interval", str(args.save_interval),
+        "--seed", str(args.seed),
+    ])
+    if args.checkpoint:
+        cmd.extend(["--checkpoint", args.checkpoint])
+    for value in args.negative_image_dir or []:
+        cmd.extend(["--negative-image-dir", value])
+    return _run(cmd)
+
+
+def _eval_inversion_trace(args: argparse.Namespace) -> int:
+    cmd = _python_module_cmd("scripts.eval_inversion_trace")
+    cmd.extend([
+        "--config", args.config,
+        "--checkpoint", args.checkpoint,
+        "--positive-dir", args.positive_dir,
+        "--output-dir", args.output_dir,
+        "--device", args.device,
+        "--batch-size", str(args.batch_size),
+        "--num-batches", str(args.num_batches),
+        "--num-workers", str(args.num_workers),
+    ])
+    for value in args.negative_image_dir or []:
+        cmd.extend(["--negative-image-dir", value])
+    return _run(cmd)
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="TraceFlow single-YAML server-friendly CLI.")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -2405,6 +2459,44 @@ def _parse_args() -> argparse.Namespace:
     _add_common_entry_args(paper)
     paper.add_argument("--output-dir", default=None, help="Curated output folder (default PAPER_CIFAR32_RESULTS/).")
     paper.set_defaults(func=_paper_figures)
+    trace_data = sub.add_parser("build-inversion-trace-dataset", help="Build positive raw no-key inversion images for forensic trace detector training.")
+    trace_data.add_argument("--output-dir", required=True)
+    trace_data.add_argument("--inversion-run-dir", action="append", default=[])
+    trace_data.add_argument("--positive-dir", action="append", default=[])
+    trace_data.add_argument("--pattern", default="*raw_nokey*.png")
+    trace_data.add_argument("--tile-size", type=int, default=32)
+    trace_data.add_argument("--split-grids", action="store_true")
+    trace_data.add_argument("--max-images", type=int, default=0)
+    trace_data.set_defaults(func=_build_inversion_trace_dataset)
+
+    trace_train = sub.add_parser("train-inversion-trace-detector", help="Detector-only training for raw inversion traceability with clean false-positive control.")
+    trace_train.add_argument("--config", default=DEFAULT_CONFIG)
+    trace_train.add_argument("--checkpoint", default=None)
+    trace_train.add_argument("--positive-dir", required=True)
+    trace_train.add_argument("--negative-image-dir", action="append", default=[])
+    trace_train.add_argument("--output-dir", required=True)
+    trace_train.add_argument("--device", default="auto")
+    trace_train.add_argument("--steps", type=int, default=2000)
+    trace_train.add_argument("--batch-size", type=int, default=32)
+    trace_train.add_argument("--learning-rate", type=float, default=1e-4)
+    trace_train.add_argument("--num-workers", type=int, default=2)
+    trace_train.add_argument("--log-interval", type=int, default=50)
+    trace_train.add_argument("--save-interval", type=int, default=500)
+    trace_train.add_argument("--seed", type=int, default=42)
+    trace_train.set_defaults(func=_train_inversion_trace_detector)
+
+    trace_eval = sub.add_parser("eval-inversion-trace", help="Evaluate raw inversion traceability, clean false positives, and AUROC.")
+    trace_eval.add_argument("--config", default=DEFAULT_CONFIG)
+    trace_eval.add_argument("--checkpoint", required=True)
+    trace_eval.add_argument("--positive-dir", required=True)
+    trace_eval.add_argument("--negative-image-dir", action="append", default=[])
+    trace_eval.add_argument("--output-dir", required=True)
+    trace_eval.add_argument("--device", default="auto")
+    trace_eval.add_argument("--batch-size", type=int, default=32)
+    trace_eval.add_argument("--num-batches", type=int, default=32)
+    trace_eval.add_argument("--num-workers", type=int, default=2)
+    trace_eval.set_defaults(func=_eval_inversion_trace)
+
     estimate = sub.add_parser("estimate-5090", help="Static, CUDA-free preflight: estimate safe micro-batch sizes per training stage for an RTX 5090 32GB.")
     estimate.add_argument("--config", default=DEFAULT_CONFIG, help="Config to inspect (e.g. configs/traceflow_cifar32.yml).")
     estimate.set_defaults(func=_estimate_5090_batch)
